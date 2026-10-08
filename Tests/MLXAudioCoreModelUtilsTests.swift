@@ -14,6 +14,13 @@ import os
 import HuggingFace
 @testable import MLXAudioCore
 
+extension Result {
+    fileprivate var isFailure: Bool {
+        if case .failure = self { return true }
+        return false
+    }
+}
+
 private func makeTemporaryCacheDirectory() throws -> URL {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("modelutils-cache-\(UUID().uuidString)", isDirectory: true)
@@ -53,7 +60,10 @@ private final class ListingProtocol: URLProtocol, @unchecked Sendable {
     static let listings = OSAllocatedUnfairLock(initialState: [String: Data]())
     static let served = OSAllocatedUnfairLock(initialState: [String: [String: Data]]())
     static let listingCounts = OSAllocatedUnfairLock(initialState: [String: Int]())
+    static let listingPaths = OSAllocatedUnfairLock(initialState: [String: [String]]())
     static let otherRequests = OSAllocatedUnfairLock(initialState: [String: [String]]())
+    /// Hosts whose requests are held open until the client gives up.
+    static let hanging = OSAllocatedUnfairLock(initialState: Set<String>())
 
     override class func canInit(with request: URLRequest) -> Bool { true }
 
@@ -62,9 +72,14 @@ private final class ListingProtocol: URLProtocol, @unchecked Sendable {
     override func startLoading() {
         let url = request.url!
         let host = url.host!
+        if Self.hanging.withLock({ $0.contains(host) }) {
+            Self.listingCounts.withLock { $0[host, default: 0] += 1 }
+            return  // answered never; `stopLoading` ends it
+        }
         if url.path.contains("/tree/"),
            let body = Self.listings.withLock({ $0[host] }) {
             Self.listingCounts.withLock { $0[host, default: 0] += 1 }
+            Self.listingPaths.withLock { $0[host, default: []].append(url.path) }
             let response = HTTPURLResponse(
                 url: url, statusCode: 200, httpVersion: "HTTP/1.1",
                 headerFields: ["Content-Type": "application/json"])!
@@ -108,16 +123,36 @@ private struct ListingFixture {
     let host: URL
     let session: URLSession
 
+    static let commit = String(repeating: "a", count: 40)
+
     /// `files` is what the Hub lists for the repo, as (path, type) pairs;
-    /// `served` the files it hands out, by path.
-    init(files: [(String, String)], served: [String: Data] = [:]) throws {
+    /// `served` the files it hands out, by path. `cachedCommit` writes the
+    /// Hub cache's `refs/main` the way a first download would, so the resolve
+    /// works at that commit; `populated` false leaves the model directory
+    /// absent (a fresh download); `hangs` makes the Hub never answer.
+    init(
+        files: [(String, String)], served: [String: Data] = [:],
+        cachedCommit: Bool = false, populated: Bool = true, hangs: Bool = false
+    ) throws {
         ModelUtils.forgetFailedListings()
         root = try makeTemporaryCacheDirectory()
         cache = HubCache(cacheDirectory: root)
         repoID = try #require(Repo.ID(rawValue: "mlx-audio-tests/listing-fixture"))
-        modelDir = try populateCachedModel(cache: cache, repoID: repoID, patternsManifest: "")
+        if populated {
+            modelDir = try populateCachedModel(cache: cache, repoID: repoID, patternsManifest: "")
+        } else {
+            modelDir = cache.cacheDirectory
+                .appendingPathComponent("mlx-audio")
+                .appendingPathComponent(repoID.description.replacingOccurrences(of: "/", with: "_"))
+        }
+        if cachedCommit {
+            try cache.updateRef(repo: repoID, kind: .model, ref: "main", commit: Self.commit)
+        }
         let listingHost = URL(string: "https://listing-\(UUID().uuidString.lowercased()).invalid")!
         host = listingHost
+        if hangs {
+            ListingProtocol.hanging.withLock { _ = $0.insert(listingHost.host!) }
+        }
         let entries = files.map { ["type": $0.1, "path": $0.0, "oid": "0", "size": 1] as [String: Any] }
         let body = try JSONSerialization.data(withJSONObject: entries)
         let hostName = listingHost.host!
@@ -132,6 +167,10 @@ private struct ListingFixture {
 
     var listingCount: Int {
         ListingProtocol.listingCounts.withLock { $0[host.host!] ?? 0 }
+    }
+
+    var listingPaths: [String] {
+        ListingProtocol.listingPaths.withLock { $0[host.host!] ?? [] }
     }
 
     /// Every request that was not a listing, as "METHOD path".
@@ -159,7 +198,9 @@ private struct ListingFixture {
         ListingProtocol.listings.withLock { _ = $0.removeValue(forKey: host.host!) }
         ListingProtocol.served.withLock { _ = $0.removeValue(forKey: host.host!) }
         ListingProtocol.listingCounts.withLock { _ = $0.removeValue(forKey: host.host!) }
+        ListingProtocol.listingPaths.withLock { _ = $0.removeValue(forKey: host.host!) }
         ListingProtocol.otherRequests.withLock { _ = $0.removeValue(forKey: host.host!) }
+        ListingProtocol.hanging.withLock { _ = $0.remove(host.host!) }
         try? FileManager.default.removeItem(at: root)
     }
 }
@@ -262,7 +303,7 @@ private func populateCachedModel(
     return modelDir
 }
 
-@Suite("ModelUtils cache completeness")
+@Suite("ModelUtils cache completeness", .serialized)
 struct ModelUtilsCacheTests {
 
     @Test func cachedModelWithoutManifestServesPlainLoad() async throws {
@@ -434,6 +475,102 @@ struct ModelUtilsCacheTests {
             fixture.otherRequests.allSatisfy { $0.hasSuffix("/am.mvn") },
             "only the missing file is asked for: \(fixture.otherRequests)")
         #expect(fixture.weightsIdentifier == weightsBefore, "the weights already on disk are neither downloaded nor replaced")
+    }
+
+    @Test func theDifferenceIsFetchedAtTheCachedCommit() async throws {
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("model.safetensors", "file"), ("am.mvn", "file")],
+            served: ["am.mvn": Data("mvn bytes".utf8)], cachedCommit: true)
+        defer { fixture.cleanUp() }
+
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        let commit = ListingFixture.commit
+        #expect(fixture.listingPaths.allSatisfy { $0.contains("/tree/\(commit)") }, "listed at the cached commit: \(fixture.listingPaths)")
+        #expect(fixture.otherRequests.allSatisfy { $0.contains("/resolve/\(commit)/am.mvn") }, "fetched at the cached commit: \(fixture.otherRequests)")
+        let refs = (try? FileManager.default.contentsOfDirectory(
+            atPath: fixture.cache.refsDirectory(repo: fixture.repoID, kind: .model).path)) ?? []
+        #expect(refs == ["main"], "no ref is written for the commit itself: \(refs)")
+        #expect(fixture.manifest.contains("*.mvn"))
+    }
+
+    @Test func aListedPathThatLeavesTheModelDirectoryIsRefused() async throws {
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("model.safetensors", "file"), ("tokenizer/../../escape.txt", "file")],
+            served: ["tokenizer/../../escape.txt": Data("escaped".utf8)])
+        defer { fixture.cleanUp() }
+
+        await #expect(throws: ModelUtilsError.self) {
+            _ = try await ModelUtils.resolveOrDownloadModel(
+                client: fixture.client,
+                cache: fixture.cache,
+                repoID: fixture.repoID,
+                requiredExtension: "safetensors",
+                additionalMatchingPatterns: ["tokenizer*"]
+            )
+        }
+        #expect(fixture.otherRequestCount == 0, "nothing is fetched from a listing that names such a path")
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("escape.txt").path))
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.deletingLastPathComponent().appendingPathComponent("escape.txt").path))
+        #expect(!fixture.manifest.contains("tokenizer*"))
+    }
+
+    @Test func aFreshFetchOfTheDefaultsAloneDoesNotListForCertification() async throws {
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("model.safetensors", "file")],
+            served: ["config.json": Data("{}".utf8), "model.safetensors": Data([0x01])],
+            populated: false)
+        defer { fixture.cleanUp() }
+
+        let resolved = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors"
+        )
+        #expect(resolved.standardizedFileURL == fixture.modelDir.standardizedFileURL)
+        #expect(fixture.listingCount == 1, "only the snapshot download's own listing; nothing to certify")
+        #expect(FileManager.default.fileExists(atPath: fixture.modelDir.appendingPathComponent("model.safetensors").path))
+    }
+
+    @Test func aCancelledResolveLeavesNoBackoffBehind() async throws {
+        let fixture = try ListingFixture(files: [("config.json", "file"), ("model.safetensors", "file")], hangs: true)
+        defer { fixture.cleanUp() }
+
+        let resolving = Task {
+            try await ModelUtils.resolveOrDownloadModel(
+                client: fixture.client,
+                cache: fixture.cache,
+                repoID: fixture.repoID,
+                requiredExtension: "safetensors",
+                additionalMatchingPatterns: ["*.mvn"]
+            )
+        }
+        // Wait (polling) until the listing is in flight, then cancel the caller.
+        let deadline = ContinuousClock.now + .seconds(30)
+        while fixture.listingCount == 0, ContinuousClock.now < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        #expect(fixture.listingCount == 1)
+        resolving.cancel()
+        let outcome = await resolving.result
+        #expect(outcome.isFailure, "a cancelled caller is not answered from the cache")
+
+        // Not booked as the Hub's failure: the next resolve asks again.
+        ListingProtocol.hanging.withLock { _ = $0.remove(fixture.host.host!) }
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(fixture.listingCount == 2, "the Hub is asked again after a cancellation")
     }
 
     @Test func aFailedListingIsNotRetriedForAWhile() async throws {
