@@ -891,6 +891,31 @@ struct ModelUtilsCacheTests {
         #expect(!fixture.manifest.contains("*.mvn"))
     }
 
+    @Test func aManifestBesideAnUnusableSnapshotIsDroppedEvenWhenTheFetchFails() async throws {
+        // The same half-state, with nothing in the client's cache to fall
+        // back on: the fetch fails outright. The manifest must already be
+        // gone, or a fetch that failed after copying the config would leave
+        // it beside a snapshot the next resolve can use.
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("model.safetensors", "file"), ("am.mvn", "file")],
+            populated: false, failAfterListings: 0)
+        defer { fixture.cleanUp() }
+        try FileManager.default.createDirectory(at: fixture.modelDir, withIntermediateDirectories: true)
+        try Data([0x01]).write(to: fixture.modelDir.appendingPathComponent("model.safetensors"))
+        try Data("*.mvn".utf8).write(to: fixture.modelDir.appendingPathComponent(".mlx-audio-patterns"))
+
+        await #expect(throws: (any Error).self) {
+            _ = try await ModelUtils.resolveOrDownloadModel(
+                client: fixture.client,
+                cache: fixture.cache,
+                repoID: fixture.repoID,
+                requiredExtension: "safetensors",
+                additionalMatchingPatterns: ["*.mvn"]
+            )
+        }
+        #expect(!fixture.manifest.contains("*.mvn"), "dropped before the fetch, not after it")
+    }
+
     @Test func aRepositoryTheHubNoLongerHasThatAnswersLateIsNotRetriedForAWhile() async throws {
         let fixture = try ListingFixture(
             files: [("config.json", "file"), ("model.safetensors", "file")], cachedCommit: true,
