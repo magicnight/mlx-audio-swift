@@ -908,7 +908,7 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
     ///
     /// Supports both Regular (`Chatterbox-TTS-fp16`) and Turbo (`chatterbox-turbo-fp16`).
     /// Automatically detects model variant from config.json.
-    public static func fromPretrained(_ modelRepo: String) async throws -> ChatterboxModel {
+    public static func fromPretrained(_ modelRepo: String, cache: HubCache = .default) async throws -> ChatterboxModel {
         let hfToken: String? = ProcessInfo.processInfo.environment["HF_TOKEN"]
             ?? Bundle.main.object(forInfoDictionaryKey: "HF_TOKEN") as? String
 
@@ -919,7 +919,8 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         let modelDir = try await ModelUtils.resolveOrDownloadModel(
             repoID: repoID,
             requiredExtension: "safetensors",
-            hfToken: hfToken
+            hfToken: hfToken,
+            cache: cache
         )
 
         return try await fromModelDirectory(modelDir, hfToken: hfToken)

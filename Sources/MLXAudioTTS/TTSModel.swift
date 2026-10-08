@@ -182,7 +182,7 @@ public enum TTS {
             return try await load(
                 source,
                 modelType: resolvedType,
-                pretrained: { modelRepo, _ in try await ChatterboxModel.fromPretrained(modelRepo) },
+                pretrained: { try await ChatterboxModel.fromPretrained($0, cache: $1) },
                 local: { modelDir, _ in try await ChatterboxModel.fromModelDirectory(modelDir, hfToken: nil) }
             )
         case "kitten_tts", "kitten":
