@@ -64,6 +64,11 @@ private final class ListingProtocol: URLProtocol, @unchecked Sendable {
     static let otherRequests = OSAllocatedUnfairLock(initialState: [String: [String]]())
     /// Hosts whose requests are held open until the client gives up.
     static let hanging = OSAllocatedUnfairLock(initialState: Set<String>())
+    /// Revisions a host answers a tree listing for with a 404, per host.
+    static let notFoundRevisions = OSAllocatedUnfairLock(initialState: [String: Set<String>]())
+    /// Per host, the number of listings answered before every further one
+    /// fails with a 500.
+    static let failAfterListings = OSAllocatedUnfairLock(initialState: [String: Int]())
 
     override class func canInit(with request: URLRequest) -> Bool { true }
 
@@ -78,13 +83,29 @@ private final class ListingProtocol: URLProtocol, @unchecked Sendable {
         }
         if url.path.contains("/tree/"),
            let body = Self.listings.withLock({ $0[host] }) {
-            Self.listingCounts.withLock { $0[host, default: 0] += 1 }
+            let count: Int = Self.listingCounts.withLock { counts in
+                counts[host, default: 0] += 1
+                return counts[host, default: 0]
+            }
             Self.listingPaths.withLock { $0[host, default: []].append(url.path) }
+            // `/api/models/<ns>/<name>/tree/<revision>`.
+            let revision = url.path.components(separatedBy: "/tree/").last?
+                .split(separator: "/").first.map(String.init) ?? ""
+            let status: Int
+            if Self.notFoundRevisions.withLock({ $0[host]?.contains(revision) ?? false }) {
+                status = 404
+            } else if let limit = Self.failAfterListings.withLock({ $0[host] }), count > limit {
+                status = 500
+            } else {
+                status = 200
+            }
             let response = HTTPURLResponse(
-                url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                url: url, statusCode: status, httpVersion: "HTTP/1.1",
                 headerFields: ["Content-Type": "application/json"])!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: body)
+            if status == 200 {
+                client?.urlProtocol(self, didLoad: body)
+            }
             client?.urlProtocolDidFinishLoading(self)
             return
         }
@@ -129,10 +150,13 @@ private struct ListingFixture {
     /// `served` the files it hands out, by path. `cachedCommit` writes the
     /// Hub cache's `refs/main` the way a first download would, so the resolve
     /// works at that commit; `populated` false leaves the model directory
-    /// absent (a fresh download); `hangs` makes the Hub never answer.
+    /// absent (a fresh download); `hangs` makes the Hub never answer;
+    /// `notFoundRevisions` are answered 404 for a listing; after
+    /// `failAfterListings` listings every further one is answered 500.
     init(
         files: [(String, String)], served: [String: Data] = [:],
-        cachedCommit: Bool = false, populated: Bool = true, hangs: Bool = false
+        cachedCommit: Bool = false, populated: Bool = true, hangs: Bool = false,
+        notFoundRevisions: Set<String> = [], failAfterListings: Int? = nil
     ) throws {
         ModelUtils.forgetFailedListings()
         root = try makeTemporaryCacheDirectory()
@@ -158,6 +182,12 @@ private struct ListingFixture {
         let hostName = listingHost.host!
         ListingProtocol.listings.withLock { $0[hostName] = body }
         ListingProtocol.served.withLock { $0[hostName] = served }
+        if !notFoundRevisions.isEmpty {
+            ListingProtocol.notFoundRevisions.withLock { $0[hostName] = notFoundRevisions }
+        }
+        if let failAfterListings {
+            ListingProtocol.failAfterListings.withLock { $0[hostName] = failAfterListings }
+        }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ListingProtocol.self]
         session = URLSession(configuration: configuration)
@@ -184,7 +214,7 @@ private struct ListingFixture {
     var weightsIdentifier: AnyHashable? {
         let values = try? modelDir.appendingPathComponent("model.safetensors")
             .resourceValues(forKeys: [.fileResourceIdentifierKey])
-        return values?.fileResourceIdentifier.map { AnyHashable($0 as! NSObject) }
+        return values?.fileResourceIdentifier.flatMap { $0 as? NSObject }.map { AnyHashable($0) }
     }
 
     var manifest: Set<String> {
@@ -201,6 +231,8 @@ private struct ListingFixture {
         ListingProtocol.listingPaths.withLock { _ = $0.removeValue(forKey: host.host!) }
         ListingProtocol.otherRequests.withLock { _ = $0.removeValue(forKey: host.host!) }
         ListingProtocol.hanging.withLock { _ = $0.remove(host.host!) }
+        ListingProtocol.notFoundRevisions.withLock { _ = $0.removeValue(forKey: host.host!) }
+        ListingProtocol.failAfterListings.withLock { _ = $0.removeValue(forKey: host.host!) }
         try? FileManager.default.removeItem(at: root)
     }
 }
@@ -458,7 +490,7 @@ struct ModelUtilsCacheTests {
             files: [("config.json", "file"), ("model.safetensors", "file"), ("am.mvn", "file")],
             served: ["am.mvn": Data("mvn bytes".utf8)])
         defer { fixture.cleanUp() }
-        let weightsBefore = fixture.weightsIdentifier
+        let weightsBefore = try #require(fixture.weightsIdentifier)
 
         _ = try await ModelUtils.resolveOrDownloadModel(
             client: fixture.client,
@@ -515,9 +547,130 @@ struct ModelUtilsCacheTests {
             )
         }
         #expect(fixture.otherRequestCount == 0, "nothing is fetched from a listing that names such a path")
-        #expect(!FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("escape.txt").path))
-        #expect(!FileManager.default.fileExists(atPath: fixture.root.deletingLastPathComponent().appendingPathComponent("escape.txt").path))
+        // `tokenizer/../../escape.txt` under the model directory points at
+        // `<root>/mlx-audio/escape.txt`.
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("mlx-audio/escape.txt").path))
+        #expect(!FileManager.default.fileExists(atPath: fixture.modelDir.appendingPathComponent("escape.txt").path))
         #expect(!fixture.manifest.contains("tokenizer*"))
+    }
+
+    @Test func theEntryPathRuleRefusesWhatCannotBeWrittenUnderTheModelDirectory() throws {
+        let modelDir = URL(fileURLWithPath: "/tmp/model-dir", isDirectory: true)
+        for path in ["/x", "a//b", "a\\b", "a\0b", "..", "a/../b", ".", "", " ", "a/"] {
+            #expect(throws: ModelUtilsError.self, "\(path.debugDescription) must be refused") {
+                try ModelUtils.validateEntryPath(path, under: modelDir)
+            }
+        }
+        for path in ["a..b", "./a", "a/b.c", "tokenizer/vocab.json", ".mlx-audio-patterns"] {
+            #expect(throws: Never.self, "\(path.debugDescription) must be allowed") {
+                try ModelUtils.validateEntryPath(path, under: modelDir)
+            }
+        }
+    }
+
+    @Test func aCachedCommitTheHubNoLongerHasIsCompletedFromMain() async throws {
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("model.safetensors", "file"), ("am.mvn", "file")],
+            served: ["am.mvn": Data("mvn bytes".utf8)], cachedCommit: true,
+            notFoundRevisions: [ListingFixture.commit])
+        defer { fixture.cleanUp() }
+
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        let revisions = fixture.listingPaths.map { $0.components(separatedBy: "/tree/").last ?? "" }
+        #expect(revisions == [ListingFixture.commit, "main"], "the cached commit first, then main: \(fixture.listingPaths)")
+        #expect(fixture.otherRequests.allSatisfy { $0.contains("/resolve/main/am.mvn") }, "fetched at main: \(fixture.otherRequests)")
+        #expect(try Data(contentsOf: fixture.modelDir.appendingPathComponent("am.mvn")) == Data("mvn bytes".utf8))
+        #expect(fixture.manifest.contains("*.mvn"))
+    }
+
+    @Test func aRepositoryTheHubNoLongerHasIsServedAsItIsAndAskedAgainNextTime() async throws {
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("model.safetensors", "file")], cachedCommit: true,
+            notFoundRevisions: [ListingFixture.commit, "main"])
+        defer { fixture.cleanUp() }
+
+        let resolved = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(resolved.standardizedFileURL == fixture.modelDir.standardizedFileURL, "served as it is")
+        #expect(fixture.listingCount == 2, "the cached commit, then main")
+        #expect(fixture.otherRequestCount == 0)
+        #expect(!fixture.manifest.contains("*.mvn"))
+        // A definite answer costs nothing to ask for again: no backoff.
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(fixture.listingCount == 4, "asked again at once")
+    }
+
+    @Test func aListingTheHubRefusedOutrightBooksNoBackoff() async throws {
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("model.safetensors", "file")], failAfterListings: 0)
+        defer { fixture.cleanUp() }
+
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(fixture.listingCount == 1)
+        #expect(!fixture.manifest.contains("*.mvn"))
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(fixture.listingCount == 2, "a quick failure is asked about again next time")
+    }
+
+    @Test func aFreshFetchServedFromTheClientsOwnCacheCertifiesNothingItLacks() async throws {
+        // The client's cache already holds a `models--` snapshot of the config
+        // and weights (the library's delete leaves exactly this behind, since
+        // it removes the model directory only), and the Hub lists am.mvn too.
+        // Our listing succeeds; the snapshot download's own listing then fails
+        // and it serves the cached snapshot, without am.mvn.
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("model.safetensors", "file"), ("am.mvn", "file")],
+            cachedCommit: true, populated: false, failAfterListings: 1)
+        defer { fixture.cleanUp() }
+        let snapshot = try fixture.cache.snapshotPath(
+            repo: fixture.repoID, kind: .model, commitHash: ListingFixture.commit)
+        try FileManager.default.createDirectory(at: snapshot, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: snapshot.appendingPathComponent("config.json"))
+        try Data([0x01]).write(to: snapshot.appendingPathComponent("model.safetensors"))
+
+        let resolved = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(resolved.standardizedFileURL == fixture.modelDir.standardizedFileURL)
+        #expect(fixture.listingCount == 2, "ours, then the snapshot download's")
+        #expect(
+            FileManager.default.fileExists(atPath: fixture.modelDir.appendingPathComponent("model.safetensors").path),
+            "served from the client's own cache")
+        #expect(!FileManager.default.fileExists(atPath: fixture.modelDir.appendingPathComponent("am.mvn").path))
+        #expect(!fixture.manifest.contains("*.mvn"), "a file the download did not bring is not certified")
     }
 
     @Test func aFreshFetchOfTheDefaultsAloneDoesNotListForCertification() async throws {
@@ -573,10 +726,23 @@ struct ModelUtilsCacheTests {
         #expect(fixture.listingCount == 2, "the Hub is asked again after a cancellation")
     }
 
-    @Test func aFailedListingIsNotRetriedForAWhile() async throws {
-        let fixture = try OfflineCacheFixture()
+    @Test func aListingThatRanOutOfTimeIsNotRetriedForAWhile() async throws {
+        let fixture = try ListingFixture(files: [("config.json", "file"), ("model.safetensors", "file")], hangs: true)
         defer { fixture.cleanUp() }
 
+        // The Hub never answers: the attempt gives up after `listingTimeout`
+        // and the snapshot is served as it is.
+        let resolved = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(resolved.standardizedFileURL == fixture.modelDir.standardizedFileURL)
+        #expect(fixture.listingCount == 1)
+        #expect(!fixture.manifest.contains("*.mvn"))
+        ListingProtocol.hanging.withLock { _ = $0.remove(fixture.host.host!) }
         _ = try await ModelUtils.resolveOrDownloadModel(
             client: fixture.client,
             cache: fixture.cache,
@@ -584,16 +750,7 @@ struct ModelUtilsCacheTests {
             requiredExtension: "safetensors",
             additionalMatchingPatterns: ["*.mvn"]
         )
-        let afterFirst = fixture.requestCount
-        #expect(afterFirst > 0, "the first resolve asks")
-        _ = try await ModelUtils.resolveOrDownloadModel(
-            client: fixture.client,
-            cache: fixture.cache,
-            repoID: fixture.repoID,
-            requiredExtension: "safetensors",
-            additionalMatchingPatterns: ["*.mvn"]
-        )
-        #expect(fixture.requestCount == afterFirst, "a repo that could not be listed is not asked again at once")
+        #expect(fixture.listingCount == 1, "a repo whose listing ran out of time is not asked again at once")
         ModelUtils.forgetFailedListings()
         _ = try await ModelUtils.resolveOrDownloadModel(
             client: fixture.client,
@@ -602,7 +759,8 @@ struct ModelUtilsCacheTests {
             requiredExtension: "safetensors",
             additionalMatchingPatterns: ["*.mvn"]
         )
-        #expect(fixture.requestCount > afterFirst, "once the backoff is over it asks again")
+        #expect(fixture.listingCount == 2, "once the backoff is over it asks again, and this time the Hub answers")
+        #expect(fixture.manifest.contains("*.mvn"))
     }
 
     @Test func aListedFileAlreadyOnDiskIsNotFetchedAgain() async throws {

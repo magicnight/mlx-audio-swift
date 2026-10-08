@@ -142,14 +142,14 @@ public enum ModelUtils {
         // no Whisper repo has one), and the Hub client serves the cached
         // snapshot when it cannot list, so without a listing nothing new may
         // be recorded, or an offline load would mark files as present that
-        // were never fetched. One request, bounded in time and not repeated
-        // for a while after it fails, taken at most once per snapshot and set
-        // of patterns while the Hub answers; afterwards the hit above answers.
-        // Only when there is something to certify: a fresh fetch of the default
-        // patterns alone has no pattern to record, and a listing that fails
-        // there would otherwise be remembered against the loader's resolve
-        // that follows it.
-        let needsListing = usableSnapshot || !requested.subtracting(defaults).isEmpty
+        // were never fetched. One request, bounded in time (two when the Hub
+        // no longer has the cached commit and `main` is tried), not repeated
+        // for a while after it ran out of time, and taken at most once per
+        // snapshot and set of patterns while the Hub answers; afterwards the
+        // hit above answers. Only when there is something to certify: a fresh
+        // fetch of the default patterns alone has no pattern to record (a
+        // usable snapshot that fell through has one by construction).
+        let needsListing = !requested.subtracting(defaults).isEmpty
         let listed = needsListing ? await listRepository(repoID, client: client, revision: revision) : nil
         try Task.checkCancellation()
         let listing = listed?.entries
@@ -213,9 +213,6 @@ public enum ModelUtils {
                 matching: Array(patterns),
                 progressHandler: progress
             )
-            // The Hub answered: a listing that failed earlier is forgotten.
-            failedListings.withLock { _ = $0.removeValue(forKey: repoID.description) }
-
             // Post-download validation: ensure required files are non-zero
             let downloadedFiles = try? FileManager.default.contentsOfDirectory(
                 at: modelDir, includingPropertiesForKeys: [.fileSizeKey]
@@ -231,7 +228,22 @@ public enum ModelUtils {
                 throw ModelUtilsError.incompleteDownload(repoID.description)
             }
             print("Model downloaded to: \(modelDir.path)")
-            fetched = requested.union(recorded)
+            // Recorded from evidence, as above: the snapshot download serves
+            // the client's own cached snapshot when it cannot list, which may
+            // lack what the listing taken a moment earlier names, so only a
+            // pattern whose listed files are all on disk now is complete.
+            if let listing {
+                let lacking = listing.filter { entry in
+                    entry.type == .file
+                        && requested.contains { fnmatch($0, entry.path, 0) == 0 }
+                        && !FileManager.default.fileExists(atPath: modelDir.appendingPathComponent(entry.path).path)
+                }
+                fetched = requested.filter { pattern in
+                    !lacking.contains { fnmatch(pattern, $0.path, 0) == 0 }
+                }
+            } else {
+                fetched = []
+            }
         }
 
         // Only a listing proves the patterns are complete; a download that the
@@ -246,8 +258,10 @@ public enum ModelUtils {
     /// on its own when no token is given, applied to the token client too so
     /// a mirror user is not sent to huggingface.co for one of the two.
     public static var hubHost: URL {
+        // The same parse as `HubClient`'s, so both clients read one value
+        // the same way.
         if let endpoint = ProcessInfo.processInfo.environment["HF_ENDPOINT"],
-           let url = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)) {
+           let url = URL(string: endpoint) {
             return url
         }
         return HubClient.defaultHost
@@ -270,10 +284,12 @@ public enum ModelUtils {
         }
     }
 
-    /// Repos whose listing failed, with when. A network that drops packets
-    /// rather than refusing them costs a cold load one attempt of at most
-    /// `listingTimeout`, and the next cold loads of that repo nothing for
-    /// `listingRetryInterval`, instead of a minute per resolve.
+    /// Repos whose listing ran out of time, with when. A network that drops
+    /// packets rather than refusing them costs a cold load one attempt of at
+    /// most `listingTimeout`, and the next cold loads of that repo nothing for
+    /// `listingRetryInterval`, instead of a minute per resolve. A quick
+    /// failure (no network, a refused connection, a definite answer such as
+    /// a 404) costs nothing to repeat and is not remembered.
     private static let failedListings = OSAllocatedUnfairLock<[String: Date]>(initialState: [:])
     static let listingTimeout: Duration = .seconds(10)
     static let listingRetryInterval: TimeInterval = 600
@@ -293,6 +309,7 @@ public enum ModelUtils {
         case listed([Git.TreeEntry])
         case notFound
         case failed
+        case timedOut
     }
 
     private static func attemptListing(
@@ -313,7 +330,7 @@ public enum ModelUtils {
             }
             group.addTask {
                 try? await Task.sleep(for: listingTimeout)
-                return .failed
+                return .timedOut
             }
             let first = await group.next() ?? .failed
             group.cancelAll()
@@ -343,8 +360,10 @@ public enum ModelUtils {
         case .listed(let entries):
             failedListings.withLock { _ = $0.removeValue(forKey: key) }
             return Listing(entries: entries, revision: usedRevision)
-        case .notFound, .failed:
+        case .timedOut:
             failedListings.withLock { $0[key] = Date() }
+            return nil
+        case .notFound, .failed:
             return nil
         }
     }
@@ -359,8 +378,10 @@ public enum ModelUtils {
         else {
             throw ModelUtilsError.unsafeEntryPath(path)
         }
-        let root = modelDir.standardizedFileURL.path
-        let destination = modelDir.appendingPathComponent(path).standardizedFileURL.path
+        // Lexical, like the cache's own path rule: the filesystem has no say
+        // in whether a listed path stays under the directory.
+        let root = modelDir.standardized.path
+        let destination = modelDir.appendingPathComponent(path).standardized.path
         guard destination.hasPrefix(root + "/") else {
             throw ModelUtilsError.unsafeEntryPath(path)
         }
@@ -412,7 +433,7 @@ public enum ModelUtils {
 
 public enum ModelUtilsError: LocalizedError {
     case incompleteDownload(String)
-    /// The Hub listed a path that would leave the model directory.
+    /// The Hub listed a path that cannot be written under the model directory.
     case unsafeEntryPath(String)
 
     public var errorDescription: String? {
@@ -421,7 +442,7 @@ public enum ModelUtilsError: LocalizedError {
             return "Downloaded model '\(repo)' has missing or zero-byte weight files. "
                 + "The cache has been cleared — please try again."
         case .unsafeEntryPath(let path):
-            return "The repository listing names a file outside the model directory: '\(path)'."
+            return "The repository listing names a path that cannot be written under the model directory: '\(path)'."
         }
     }
 }
