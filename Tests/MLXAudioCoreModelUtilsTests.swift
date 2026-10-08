@@ -45,6 +45,81 @@ private final class OfflineCacheProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
+/// Answers the repo tree listing for hosts it knows and fails every other
+/// request, counting them: a Hub that can be asked what a pattern names but
+/// serves no files.
+private final class ListingProtocol: URLProtocol, @unchecked Sendable {
+    static let listings = OSAllocatedUnfairLock(initialState: [String: Data]())
+    static let otherRequests = OSAllocatedUnfairLock(initialState: [String: Int]())
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let host = request.url!.host!
+        if request.url!.path.contains("/tree/"),
+           let body = Self.listings.withLock({ $0[host] }) {
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"])!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: body)
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+        Self.otherRequests.withLock { $0[host, default: 0] += 1 }
+        client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+    }
+
+    override func stopLoading() {}
+}
+
+private struct ListingFixture {
+    let root: URL
+    let cache: HubCache
+    let repoID: Repo.ID
+    let modelDir: URL
+    let host: URL
+    let session: URLSession
+
+    /// `files` is what the Hub lists for the repo, as (path, type) pairs.
+    init(files: [(String, String)]) throws {
+        root = try makeTemporaryCacheDirectory()
+        cache = HubCache(cacheDirectory: root)
+        repoID = try #require(Repo.ID(rawValue: "mlx-audio-tests/listing-fixture"))
+        modelDir = try populateCachedModel(cache: cache, repoID: repoID, patternsManifest: "")
+        let listingHost = URL(string: "https://listing-\(UUID().uuidString.lowercased()).invalid")!
+        host = listingHost
+        let entries = files.map { ["type": $0.1, "path": $0.0, "oid": "0", "size": 1] as [String: Any] }
+        let body = try JSONSerialization.data(withJSONObject: entries)
+        let hostName = listingHost.host!
+        ListingProtocol.listings.withLock { $0[hostName] = body }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ListingProtocol.self]
+        session = URLSession(configuration: configuration)
+    }
+
+    var client: HubClient { HubClient(session: session, host: host, cache: cache) }
+
+    var otherRequestCount: Int {
+        ListingProtocol.otherRequests.withLock { $0[host.host!] ?? 0 }
+    }
+
+    var manifest: Set<String> {
+        let text = (try? String(
+            contentsOf: modelDir.appendingPathComponent(".mlx-audio-patterns"), encoding: .utf8)) ?? ""
+        return Set(text.split(separator: "\n").map(String.init))
+    }
+
+    func cleanUp() {
+        session.invalidateAndCancel()
+        ListingProtocol.listings.withLock { _ = $0.removeValue(forKey: host.host!) }
+        ListingProtocol.otherRequests.withLock { _ = $0.removeValue(forKey: host.host!) }
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
 private struct OfflineCacheFixture {
     let root: URL
     let cache: HubCache
@@ -179,25 +254,21 @@ struct ModelUtilsCacheTests {
         #expect(resolved.standardizedFileURL == modelDir.standardizedFileURL)
     }
 
-    @Test func cachedModelMissingPatternsIsNotAccepted() async throws {
-        let cacheDir = try makeTemporaryCacheDirectory()
-        defer { try? FileManager.default.removeItem(at: cacheDir) }
-        let cache = HubCache(cacheDirectory: cacheDir)
-        // A repo that does not exist: if the incomplete cache is (wrongly)
-        // accepted this returns instantly; the fixed behavior falls through
-        // to a download which must fail for this repo.
-        let repoID = try #require(Repo.ID(rawValue: "mlx-audio-tests/nonexistent-cache-fixture"))
-        try populateCachedModel(cache: cache, repoID: repoID, patternsManifest: nil)
+    @Test func cachedModelMissingPatternsAsksTheHub() async throws {
+        let fixture = try OfflineCacheFixture()
+        defer { fixture.cleanUp() }
 
-        await #expect(throws: (any Error).self) {
-            _ = try await ModelUtils.resolveOrDownloadModel(
-                client: HubClient(cache: cache),
-                cache: cache,
-                repoID: repoID,
-                requiredExtension: "safetensors",
-                additionalMatchingPatterns: ["*.mvn"]
-            )
-        }
+        // A snapshot that lacks a requested pattern is not accepted as it is:
+        // the Hub is asked what the pattern names. Here it cannot answer, so
+        // the request is the whole observable effect.
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(fixture.requestCount > 0, "a missing pattern reaches the network")
     }
 
     @Test func offlinePartialSnapshotDoesNotCertifyMissingPatterns() async throws {
@@ -229,8 +300,60 @@ struct ModelUtilsCacheTests {
         )
     }
 
-    @Test func offlineFallbackCertifiesOnlyPatternsPresentOnDisk() async throws {
+    @Test func offlineCertifiesNothingEvenForFilesOnDisk() async throws {
         let fixture = try OfflineCacheFixture()
+        defer { fixture.cleanUp() }
+        try Data([0x02]).write(to: fixture.modelDir.appendingPathComponent("am.mvn"))
+
+        let resolved = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn", "*.model"]
+        )
+        #expect(resolved.standardizedFileURL == fixture.modelDir.standardizedFileURL)
+
+        // Only the Hub's listing can say what "*.mvn" names; a file on disk
+        // does not prove the pattern is complete, so the manifest stays as
+        // the first fetch wrote it.
+        let manifest = try String(
+            contentsOf: fixture.modelDir.appendingPathComponent(".mlx-audio-patterns"),
+            encoding: .utf8
+        )
+        #expect(manifest == "")
+    }
+
+    @Test func aPatternTheRepoHasNoFileForIsCompleteOnceTheHubSaysSo() async throws {
+        let fixture = try ListingFixture(files: [("config.json", "file"), ("model.safetensors", "file")])
+        defer { fixture.cleanUp() }
+
+        let resolved = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.model"]
+        )
+        #expect(resolved.standardizedFileURL == fixture.modelDir.standardizedFileURL)
+        #expect(fixture.otherRequestCount == 0, "nothing to fetch, so nothing is downloaded or copied")
+        #expect(fixture.manifest.contains("*.model"), "the listing proves the pattern complete")
+
+        // From now on the snapshot is a hit: no request at all.
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.model"]
+        )
+        #expect(fixture.otherRequestCount == 0)
+    }
+
+    @Test func aListedFileAlreadyOnDiskIsNotFetchedAgain() async throws {
+        let fixture = try ListingFixture(files: [
+            ("config.json", "file"), ("model.safetensors", "file"), ("am.mvn", "file"),
+        ])
         defer { fixture.cleanUp() }
         try Data([0x02]).write(to: fixture.modelDir.appendingPathComponent("am.mvn"))
 
@@ -239,16 +362,32 @@ struct ModelUtilsCacheTests {
             cache: fixture.cache,
             repoID: fixture.repoID,
             requiredExtension: "safetensors",
-            additionalMatchingPatterns: ["*.mvn", "*.model"]
+            additionalMatchingPatterns: ["*.mvn"]
         )
+        #expect(fixture.otherRequestCount == 0, "the file is there; only the listing was needed")
+        #expect(fixture.manifest.contains("*.mvn"))
+    }
 
-        let manifest = try String(
-            contentsOf: fixture.modelDir.appendingPathComponent(".mlx-audio-patterns"),
-            encoding: .utf8
-        )
-        let recorded = Set(manifest.split(separator: "\n").map(String.init))
-        #expect(recorded.contains("*.mvn"))
-        #expect(!recorded.contains("*.model"))
+    @Test func aListedFileMissingFromDiskIsFetchedAndNothingIsCertifiedWhenThatFails() async throws {
+        let fixture = try ListingFixture(files: [
+            ("config.json", "file"), ("model.safetensors", "file"), ("am.mvn", "file"),
+        ])
+        defer { fixture.cleanUp() }
+
+        // The listing names am.mvn and the disk lacks it: the difference is
+        // fetched. This Hub serves no files, so the fetch fails, and the
+        // pattern must not be recorded as complete.
+        await #expect(throws: (any Error).self) {
+            _ = try await ModelUtils.resolveOrDownloadModel(
+                client: fixture.client,
+                cache: fixture.cache,
+                repoID: fixture.repoID,
+                requiredExtension: "safetensors",
+                additionalMatchingPatterns: ["*.mvn"]
+            )
+        }
+        #expect(fixture.otherRequestCount > 0, "the missing file was asked for")
+        #expect(!fixture.manifest.contains("*.mvn"))
     }
 
     @Test func defaultPatternDoesNotRedownloadCachedSnapshot() async throws {

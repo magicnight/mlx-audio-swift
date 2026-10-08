@@ -79,7 +79,18 @@ public enum ModelUtils {
             .appendingPathComponent("mlx-audio")
             .appendingPathComponent(modelSubdir)
 
-        // Check if model already exists with required files
+        let defaults = Self.defaultDownloadPatterns(requiredExtension: normalizedRequiredExtension)
+        let requested = Set(additionalMatchingPatterns)
+        var recorded = recordedPatterns(modelDir: modelDir) ?? []
+
+        // A snapshot with a non-empty weights file and a config that parses is
+        // usable. Whether it is complete for THIS caller depends on the
+        // patterns it was fetched with: resolveModelType pre-downloads with
+        // no additional patterns, so a later load that needs e.g. "*.mvn"
+        // would otherwise silently get a partial snapshot. Default patterns
+        // ("*.json", "*.safetensors", ...) come with every fetch and count as
+        // covered without a manifest entry.
+        var usableSnapshot = false
         if FileManager.default.fileExists(atPath: modelDir.path) {
             let files = try? FileManager.default.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: [.fileSizeKey])
             let hasRequiredFile = files?.contains { file in
@@ -94,61 +105,83 @@ public enum ModelUtils {
                 if FileManager.default.fileExists(atPath: configPath.path) {
                     if let configData = try? Data(contentsOf: configPath),
                        let _ = try? JSONSerialization.jsonObject(with: configData) {
-                        // A cache hit is only complete if it was downloaded
-                        // with (a superset of) the requested patterns:
-                        // resolveModelType pre-downloads with no additional
-                        // patterns, so a later load that needs e.g. "*.mvn"
-                        // would otherwise silently get a partial snapshot.
-                        //
-                        // Default patterns (e.g. "*.json", "*.safetensors")
-                        // are downloaded on every snapshot fetch, so they
-                        // count as covered without needing a manifest entry.
-                        let requestedPatterns = Set(additionalMatchingPatterns)
-                        let recorded = recordedPatterns(modelDir: modelDir) ?? []
-                        let covered = recorded.union(
-                            Self.defaultDownloadPatterns(
-                                requiredExtension: normalizedRequiredExtension
-                            )
-                        )
-                        if requestedPatterns.isSubset(of: covered) {
+                        if requested.isSubset(of: recorded.union(defaults)) {
                             print("Using cached model at: \(modelDir.path)")
                             return modelDir
                         }
-                        // Fall through and re-download with the union of
-                        // patterns; the hub cache deduplicates large blobs.
+                        usableSnapshot = true
+                        // Fall through and fetch what the uncovered patterns name.
                     } else {
                         print("Cached config.json is invalid, clearing cache...")
                         Self.clearCaches(modelDir: modelDir, repoID: repoID, hubCache: cache)
+                        recorded = []
                     }
                 }
             } else {
                 print("Cached model appears incomplete, clearing cache...")
                 Self.clearCaches(modelDir: modelDir, repoID: repoID, hubCache: cache)
+                recorded = []
             }
         }
 
         // Create directory if needed
         try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
 
-        let effectivePatterns = Set(additionalMatchingPatterns)
-            .union(recordedPatterns(modelDir: modelDir) ?? [])
+        // Ask the Hub what the patterns name. The listing is what lets a
+        // pattern be recorded as complete: a pattern the repo has no file for
+        // is complete the moment the Hub says so (Whisper asks for "*.model";
+        // no Whisper repo has one), and the Hub client serves the cached
+        // snapshot when it cannot list, so without a listing nothing new may
+        // be recorded, or an offline load would mark files as present that
+        // were never fetched. One request, taken at most once per snapshot
+        // and set of patterns while online; afterwards the hit above answers.
+        let listing = try? await client.listFiles(in: repoID, kind: .model, revision: "main", recursive: true)
+        let progress: @MainActor @Sendable (Progress) -> Void = progressHandler ?? { progress in
+            print("\(progress.completedUnitCount)/\(progress.totalUnitCount) files")
+        }
 
-        var allowedExtensions = Self.defaultDownloadPatterns(
-            requiredExtension: normalizedRequiredExtension
-        )
-        allowedExtensions.formUnion(effectivePatterns)
-
-        print("Downloading model \(repoID)...")
-        _ = try await client.downloadSnapshot(
-            of: repoID,
-            kind: .model,
-            to: modelDir,
-            revision: "main",
-            matching: Array(allowedExtensions),
-            progressHandler: progressHandler ?? { progress in
-                print("\(progress.completedUnitCount)/\(progress.totalUnitCount) files")
+        let fetched: Set<String>
+        if usableSnapshot {
+            // The weights are here; fetch only what the uncovered patterns
+            // name, into the same directory, so nothing already present is
+            // downloaded or copied again. With no listing (offline) the
+            // snapshot is served as it is, uncertified: the loader finds out
+            // whether the files it wants are there, as it always did.
+            let missing = requested.subtracting(recorded.union(defaults))
+            guard let listing else {
+                print("Using cached model at: \(modelDir.path) (the Hub could not be asked for \(missing.sorted().joined(separator: ", ")))")
+                return modelDir
             }
-        )
+            let absent = listing.filter { entry in
+                entry.type == .file
+                    && missing.contains { fnmatch($0, entry.path, 0) == 0 }
+                    && !FileManager.default.fileExists(atPath: modelDir.appendingPathComponent(entry.path).path)
+            }
+            if !absent.isEmpty {
+                print("Fetching \(absent.count) file(s) for \(repoID): \(missing.sorted().joined(separator: ", "))...")
+                _ = try await client.downloadSnapshot(
+                    of: repoID,
+                    kind: .model,
+                    to: modelDir,
+                    revision: "main",
+                    matching: Array(missing),
+                    progressHandler: progress
+                )
+            }
+            fetched = missing
+        } else {
+            let patterns = defaults.union(requested).union(recorded)
+            print("Downloading model \(repoID)...")
+            _ = try await client.downloadSnapshot(
+                of: repoID,
+                kind: .model,
+                to: modelDir,
+                revision: "main",
+                matching: Array(patterns),
+                progressHandler: progress
+            )
+            fetched = requested.union(recorded)
+        }
 
         // Post-download validation: ensure required files are non-zero
         let downloadedFiles = try? FileManager.default.contentsOfDirectory(
@@ -166,15 +199,11 @@ public enum ModelUtils {
         }
 
         print("Model downloaded to: \(modelDir.path)")
-        // Certify only the patterns the snapshot now satisfies. The Hub client
-        // serves the cached snapshot when the listing cannot be fetched, so a
-        // pattern cannot be recorded merely because it was asked for: offline,
-        // that would mark files as present that were never downloaded, and no
-        // later online load would fetch them. A pattern that matches nothing
-        // (a repo without the optional file) is never recorded and is checked
-        // against the listing again on the next load.
-        let present = patternsSatisfied(in: modelDir, among: effectivePatterns)
-        recordPatterns(modelDir: modelDir, patterns: (recordedPatterns(modelDir: modelDir) ?? []).union(present))
+        // Only a listing proves the patterns are complete; a download that the
+        // client served from its own cache proves nothing about them.
+        if listing != nil {
+            recordPatterns(modelDir: modelDir, patterns: recorded.union(fetched))
+        }
         return modelDir
     }
 
@@ -203,16 +232,6 @@ public enum ModelUtils {
               let text = String(data: data, encoding: .utf8)
         else { return nil }
         return Set(text.split(separator: "\n").map(String.init))
-    }
-
-    /// The subset of `patterns` that matches at least one file under
-    /// `modelDir`, matched the way the Hub client matches a snapshot listing
-    /// (`fnmatch` against the path relative to the snapshot root).
-    private static func patternsSatisfied(in modelDir: URL, among patterns: Set<String>) -> Set<String> {
-        let paths = (try? FileManager.default.subpathsOfDirectory(atPath: modelDir.path)) ?? []
-        return patterns.filter { pattern in
-            paths.contains { fnmatch(pattern, $0, 0) == 0 }
-        }
     }
 
     private static func recordPatterns(modelDir: URL, patterns: Set<String>) {
