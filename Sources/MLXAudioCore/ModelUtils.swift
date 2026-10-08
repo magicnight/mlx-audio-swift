@@ -144,7 +144,8 @@ public enum ModelUtils {
         // be recorded, or an offline load would mark files as present that
         // were never fetched. One request, bounded in time (two when the Hub
         // no longer has the cached commit and `main` is tried), not repeated
-        // for a while after it ran out of time, and taken at most once per
+        // for a while after it ran out of time or took seconds to fail, and
+        // taken at most once per
         // snapshot and set of patterns while the Hub answers; afterwards the
         // hit above answers. Only when there is something to certify: a fresh
         // fetch of the default patterns alone has no pattern to record (a
@@ -247,9 +248,12 @@ public enum ModelUtils {
         }
 
         // Only a listing proves the patterns are complete; a download that the
-        // client served from its own cache proves nothing about them.
+        // client served from its own cache proves nothing about them, and a
+        // manifest left beside a snapshot that was not usable (weights with
+        // no config) proves nothing either, so a fresh fetch records only
+        // what it saw land.
         if listing != nil {
-            recordPatterns(modelDir: modelDir, patterns: recorded.union(fetched))
+            recordPatterns(modelDir: modelDir, patterns: usableSnapshot ? recorded.union(fetched) : fetched)
         }
         return modelDir
     }
@@ -284,19 +288,22 @@ public enum ModelUtils {
         }
     }
 
-    /// Repos whose listing ran out of time, with when. A network that drops
-    /// packets rather than refusing them costs a cold load one attempt of at
-    /// most `listingTimeout`, and the next cold loads of that repo nothing for
-    /// `listingRetryInterval`, instead of a minute per resolve. A quick
-    /// failure (no network, a refused connection, a definite answer such as
-    /// a 404) costs nothing to repeat and is not remembered.
-    private static let failedListings = OSAllocatedUnfairLock<[String: Date]>(initialState: [:])
+    /// Repos whose listing ran out of time or took seconds to fail, with
+    /// when. A network that drops packets rather than refusing them costs a
+    /// cold load one attempt of at most `listingTimeout`, a proxy that
+    /// answers late costs it those seconds, and the next cold loads of that
+    /// repo nothing for `listingRetryInterval`, instead of that per resolve
+    /// under the lock. A failure that comes back at once (no network, a
+    /// refused connection, a definite answer such as a 404) costs nothing to
+    /// repeat and is not remembered.
+    private static let slowListingFailures = OSAllocatedUnfairLock<[String: Date]>(initialState: [:])
     static let listingTimeout: Duration = .seconds(10)
+    static let slowFailureThreshold: Duration = .seconds(2)
     static let listingRetryInterval: TimeInterval = 600
 
-    /// Test seam: forget which repos could not be listed.
-    static func forgetFailedListings() {
-        failedListings.withLock { $0.removeAll() }
+    /// Test seam: forget which repos could not be listed in time.
+    static func forgetSlowListingFailures() {
+        slowListingFailures.withLock { $0.removeAll() }
     }
 
     /// A listing and the revision it was made at.
@@ -329,8 +336,14 @@ public enum ModelUtils {
                 }
             }
             group.addTask {
-                try? await Task.sleep(for: listingTimeout)
-                return .timedOut
+                // Cancelled with the group once the listing answered, or with
+                // the caller: neither is the clock running out.
+                do {
+                    try await Task.sleep(for: listingTimeout)
+                    return .timedOut
+                } catch {
+                    return .failed
+                }
             }
             let first = await group.next() ?? .failed
             group.cancelAll()
@@ -342,10 +355,11 @@ public enum ModelUtils {
         _ repoID: Repo.ID, client: HubClient, revision: String
     ) async -> Listing? {
         let key = repoID.description
-        if let failedAt = failedListings.withLock({ $0[key] }),
+        if let failedAt = slowListingFailures.withLock({ $0[key] }),
            Date().timeIntervalSince(failedAt) < listingRetryInterval {
             return nil
         }
+        let started = ContinuousClock.now
         var attempt = await attemptListing(repoID, client: client, revision: revision)
         var usedRevision = revision
         // A cached commit the Hub no longer has (a re-upload, a force-push):
@@ -358,12 +372,21 @@ public enum ModelUtils {
         if Task.isCancelled { return nil }
         switch attempt {
         case .listed(let entries):
-            failedListings.withLock { _ = $0.removeValue(forKey: key) }
+            slowListingFailures.withLock { _ = $0.removeValue(forKey: key) }
             return Listing(entries: entries, revision: usedRevision)
         case .timedOut:
-            failedListings.withLock { $0[key] = Date() }
+            slowListingFailures.withLock { $0[key] = Date() }
             return nil
-        case .notFound, .failed:
+        case .failed:
+            // A failure that took seconds (a proxy answering late, a stalled
+            // handshake) would cost every cold load those seconds under the
+            // lock, so it is remembered like a timeout; one that came back at
+            // once costs nothing to repeat.
+            if ContinuousClock.now - started >= slowFailureThreshold {
+                slowListingFailures.withLock { $0[key] = Date() }
+            }
+            return nil
+        case .notFound:
             return nil
         }
     }
