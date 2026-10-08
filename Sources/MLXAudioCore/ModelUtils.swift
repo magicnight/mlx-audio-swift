@@ -126,6 +126,14 @@ public enum ModelUtils {
             }
         }
 
+        // A manifest beside a snapshot that could not be used (weights with
+        // no config) proves nothing: dropped before the fresh fetch, so an
+        // offline fetch cannot leave it behind for the next resolve to trust.
+        if !usableSnapshot, !recorded.isEmpty {
+            recorded = []
+            forgetRecordedPatterns(modelDir: modelDir)
+        }
+
         // Create directory if needed
         try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
 
@@ -145,9 +153,9 @@ public enum ModelUtils {
         // were never fetched. One request, bounded in time (two when the Hub
         // no longer has the cached commit and `main` is tried), not repeated
         // for a while after it ran out of time or took seconds to fail, and
-        // taken at most once per
-        // snapshot and set of patterns while the Hub answers; afterwards the
-        // hit above answers. Only when there is something to certify: a fresh
+        // taken at most once per snapshot and set of patterns while the Hub
+        // answers; afterwards the hit above answers. Only when there is
+        // something to certify: a fresh
         // fetch of the default patterns alone has no pattern to record (a
         // usable snapshot that fell through has one by construction).
         let needsListing = !requested.subtracting(defaults).isEmpty
@@ -248,12 +256,10 @@ public enum ModelUtils {
         }
 
         // Only a listing proves the patterns are complete; a download that the
-        // client served from its own cache proves nothing about them, and a
-        // manifest left beside a snapshot that was not usable (weights with
-        // no config) proves nothing either, so a fresh fetch records only
-        // what it saw land.
+        // client served from its own cache proves nothing about them, so a
+        // fresh fetch records only what it saw land.
         if listing != nil {
-            recordPatterns(modelDir: modelDir, patterns: usableSnapshot ? recorded.union(fetched) : fetched)
+            recordPatterns(modelDir: modelDir, patterns: recorded.union(fetched))
         }
         return modelDir
     }
@@ -359,6 +365,8 @@ public enum ModelUtils {
            Date().timeIntervalSince(failedAt) < listingRetryInterval {
             return nil
         }
+        // Measured over both attempts when the second is needed: every cold
+        // load would repeat the pair, so its cost is the sum.
         let started = ContinuousClock.now
         var attempt = await attemptListing(repoID, client: client, revision: revision)
         var usedRevision = revision
@@ -377,16 +385,17 @@ public enum ModelUtils {
         case .timedOut:
             slowListingFailures.withLock { $0[key] = Date() }
             return nil
-        case .failed:
+        case .failed, .notFound:
             // A failure that took seconds (a proxy answering late, a stalled
-            // handshake) would cost every cold load those seconds under the
-            // lock, so it is remembered like a timeout; one that came back at
-            // once costs nothing to repeat.
-            if ContinuousClock.now - started >= slowFailureThreshold {
+            // handshake, a 404 that a mirror takes its time over) would cost
+            // every cold load those seconds under the lock, so it is
+            // remembered like a timeout; one that came back at once costs
+            // nothing to repeat.
+            let elapsed = ContinuousClock.now - started
+            if elapsed >= slowFailureThreshold {
+                print("Listing \(key) failed after \(elapsed); not asked again for \(Int(listingRetryInterval)) s")
                 slowListingFailures.withLock { $0[key] = Date() }
             }
-            return nil
-        case .notFound:
             return nil
         }
     }
@@ -435,6 +444,10 @@ public enum ModelUtils {
               let text = String(data: data, encoding: .utf8)
         else { return nil }
         return Set(text.split(separator: "\n").map(String.init))
+    }
+
+    private static func forgetRecordedPatterns(modelDir: URL) {
+        try? FileManager.default.removeItem(at: modelDir.appendingPathComponent(patternsManifestName))
     }
 
     private static func recordPatterns(modelDir: URL, patterns: Set<String>) {
