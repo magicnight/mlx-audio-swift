@@ -155,9 +155,9 @@ public enum ModelUtils {
         // for a while after it ran out of time or took seconds to fail, and
         // taken at most once per snapshot and set of patterns while the Hub
         // answers; afterwards the hit above answers. Only when there is
-        // something to certify: a fresh
-        // fetch of the default patterns alone has no pattern to record (a
-        // usable snapshot that fell through has one by construction).
+        // something to certify: a fresh fetch of the default patterns alone
+        // has no pattern to record (a usable snapshot that fell through has
+        // one by construction).
         let needsListing = !requested.subtracting(defaults).isEmpty
         let listed = needsListing ? await listRepository(repoID, client: client, revision: revision) : nil
         try Task.checkCancellation()
@@ -257,7 +257,9 @@ public enum ModelUtils {
 
         // Only a listing proves the patterns are complete; a download that the
         // client served from its own cache proves nothing about them, so a
-        // fresh fetch records only what it saw land.
+        // fresh fetch records only what it saw land (`recorded` is empty on
+        // that branch: a snapshot that was not usable had its manifest dropped
+        // above, and a cleared one has none).
         if listing != nil {
             recordPatterns(modelDir: modelDir, patterns: recorded.union(fetched))
         }
@@ -383,6 +385,7 @@ public enum ModelUtils {
             slowListingFailures.withLock { _ = $0.removeValue(forKey: key) }
             return Listing(entries: entries, revision: usedRevision)
         case .timedOut:
+            print("Listing \(key) ran out of time (\(listingTimeout)); not asked again for \(Int(listingRetryInterval)) s")
             slowListingFailures.withLock { $0[key] = Date() }
             return nil
         case .failed, .notFound:
