@@ -574,7 +574,7 @@ public final class WhisperModel: Module, STTGenerationModel {
 
         let client: HubClient
         if let token = hfToken, !token.isEmpty {
-            client = HubClient(host: HubClient.defaultHost, bearerToken: token, cache: cache)
+            client = HubClient(host: ModelUtils.hubHost, bearerToken: token, cache: cache)
         } else {
             client = HubClient(cache: cache)
         }

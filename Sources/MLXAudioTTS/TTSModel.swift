@@ -183,8 +183,8 @@ public enum TTS {
                 source,
                 modelType: resolvedType,
                 pretrained: { try await ChatterboxModel.fromPretrained($0, cache: $1) },
-                // A local directory carries no cache: the S3 tokenizer this fetches
-                // lands in HubCache.default, as before.
+                // The local-directory source carries no cache, so the S3 tokenizer
+                // this fetches lands in HubCache.default, as before.
                 local: { modelDir, _ in try await ChatterboxModel.fromModelDirectory(modelDir, hfToken: nil) }
             )
         case "kitten_tts", "kitten":

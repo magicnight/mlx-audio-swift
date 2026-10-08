@@ -337,7 +337,7 @@ public final class EchoTTSModel: Module, @unchecked Sendable {
             cache: cache
         )
 
-        return try await fromModelDirectory(modelDir)
+        return try await fromModelDirectory(modelDir, cache: cache)
     }
 
     public static func fromModelDirectory(

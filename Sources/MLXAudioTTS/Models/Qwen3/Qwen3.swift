@@ -886,7 +886,7 @@ public class Qwen3Model: Module, KVCacheDimensionProvider, SpeechGenerationModel
             cache: cache
         )
 
-        return try await fromModelDirectory(modelDir)
+        return try await fromModelDirectory(modelDir, cache: cache)
     }
 
     public static func fromModelDirectory(
