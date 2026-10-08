@@ -929,12 +929,13 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             cache: cache
         )
 
-        return try await fromModelDirectory(modelDir, hfToken: hfToken)
+        return try await fromModelDirectory(modelDir, hfToken: hfToken, cache: cache)
     }
 
     public static func fromModelDirectory(
         _ modelDir: URL,
-        hfToken: String?
+        hfToken: String?,
+        cache: HubCache = .default
     ) async throws -> ChatterboxModel {
         // Load config
         let configURL = modelDir.appendingPathComponent("config.json")
@@ -1034,7 +1035,8 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         do {
             model.s3Tokenizer = try await S3TokenizerV2.fromPretrained(
                 s3TokenizerRepo,
-                hfToken: hfToken
+                hfToken: hfToken,
+                cache: cache
             )
             print("[Chatterbox] Loaded S3TokenizerV2 from \(s3TokenizerRepo)")
         } catch {
