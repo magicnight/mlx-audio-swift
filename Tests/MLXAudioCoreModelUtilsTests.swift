@@ -204,16 +204,17 @@ struct ModelUtilsCacheTests {
         let fixture = try OfflineCacheFixture()
         defer { fixture.cleanUp() }
 
-        await #expect(throws: (any Error).self) {
-            _ = try await ModelUtils.resolveOrDownloadModel(
-                client: fixture.client,
-                cache: fixture.cache,
-                repoID: fixture.repoID,
-                requiredExtension: "safetensors",
-                additionalMatchingPatterns: ["*.mvn"]
-            )
-        }
-
+        // The Hub client answers from the cached snapshot when the listing
+        // cannot be fetched, so this does not throw; what matters is that the
+        // attempt reached the network and that nothing certified "*.mvn".
+        let resolved = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(resolved.standardizedFileURL == fixture.modelDir.standardizedFileURL)
         #expect(fixture.requestCount > 0)
 
         let manifest = try? String(
@@ -226,6 +227,28 @@ struct ModelUtilsCacheTests {
                 .split(separator: "\n")
                 .contains("*.mvn")
         )
+    }
+
+    @Test func offlineFallbackCertifiesOnlyPatternsPresentOnDisk() async throws {
+        let fixture = try OfflineCacheFixture()
+        defer { fixture.cleanUp() }
+        try Data([0x02]).write(to: fixture.modelDir.appendingPathComponent("am.mvn"))
+
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn", "*.model"]
+        )
+
+        let manifest = try String(
+            contentsOf: fixture.modelDir.appendingPathComponent(".mlx-audio-patterns"),
+            encoding: .utf8
+        )
+        let recorded = Set(manifest.split(separator: "\n").map(String.init))
+        #expect(recorded.contains("*.mvn"))
+        #expect(!recorded.contains("*.model"))
     }
 
     @Test func defaultPatternDoesNotRedownloadCachedSnapshot() async throws {
