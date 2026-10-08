@@ -69,8 +69,13 @@ private final class ListingProtocol: URLProtocol, @unchecked Sendable {
     /// Per host, the number of listings answered before every further one
     /// fails with a 500.
     static let failAfterListings = OSAllocatedUnfairLock(initialState: [String: Int]())
-    /// Hosts whose listings fail only after this many seconds.
+    /// Hosts whose listings answer only after this many seconds: with an
+    /// error, or with a 404 for a revision in `notFoundRevisions`.
     static let delayedFailures = OSAllocatedUnfairLock(initialState: [String: TimeInterval]())
+    /// Set once `stopLoading` has reached this instance: a late answer is
+    /// then dropped. An instance flag, since an object identifier can be
+    /// reused once an earlier instance is gone.
+    private let stopped = OSAllocatedUnfairLock(initialState: false)
 
     override class func canInit(with request: URLRequest) -> Bool { true }
 
@@ -86,8 +91,20 @@ private final class ListingProtocol: URLProtocol, @unchecked Sendable {
         if url.path.contains("/tree/"), let delay = Self.delayedFailures.withLock({ $0[host] }) {
             Self.listingCounts.withLock { $0[host, default: 0] += 1 }
             Self.listingPaths.withLock { $0[host, default: []].append(url.path) }
+            let revision = url.path.components(separatedBy: "/tree/").last?
+                .split(separator: "/").first.map(String.init) ?? ""
+            let notFound = Self.notFoundRevisions.withLock { $0[host]?.contains(revision) ?? false }
             DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
-                self.client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+                if self.stopped.withLock({ $0 }) { return }
+                if notFound {
+                    let response = HTTPURLResponse(
+                        url: url, statusCode: 404, httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": "application/json"])!
+                    self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                    self.client?.urlProtocolDidFinishLoading(self)
+                } else {
+                    self.client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+                }
             }
             return
         }
@@ -143,7 +160,9 @@ private final class ListingProtocol: URLProtocol, @unchecked Sendable {
         client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        stopped.withLock { $0 = true }
+    }
 }
 
 private struct ListingFixture {
@@ -830,6 +849,72 @@ struct ModelUtilsCacheTests {
         )
         #expect(fixture.listingCount == 2, "once the backoff is over it asks again")
         #expect(fixture.manifest.contains("*.mvn"))
+    }
+
+    @Test func aManifestBesideAnUnusableSnapshotIsDroppedBeforeAFreshFetch() async throws {
+        // The half-state: weights and a manifest naming "*.mvn" survived, the
+        // config did not. The Hub cannot be listed at all, and the snapshot
+        // download falls back to a cached `models--` snapshot (config and
+        // weights, no am.mvn). The inherited manifest must not turn the next
+        // resolve into a hit on a snapshot that lacks the file.
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("model.safetensors", "file"), ("am.mvn", "file")],
+            cachedCommit: true, populated: false, failAfterListings: 0)
+        defer { fixture.cleanUp() }
+        try FileManager.default.createDirectory(at: fixture.modelDir, withIntermediateDirectories: true)
+        try Data([0x01]).write(to: fixture.modelDir.appendingPathComponent("model.safetensors"))
+        try Data("*.mvn".utf8).write(to: fixture.modelDir.appendingPathComponent(".mlx-audio-patterns"))
+        let snapshot = try fixture.cache.snapshotPath(
+            repo: fixture.repoID, kind: .model, commitHash: ListingFixture.commit)
+        try FileManager.default.createDirectory(at: snapshot, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: snapshot.appendingPathComponent("config.json"))
+        try Data([0x01]).write(to: snapshot.appendingPathComponent("model.safetensors"))
+
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(FileManager.default.fileExists(atPath: fixture.modelDir.appendingPathComponent("config.json").path), "served from the client's cache")
+        #expect(!fixture.manifest.contains("*.mvn"), "the inherited manifest is gone")
+        let listingsSoFar = fixture.listingCount
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(fixture.listingCount > listingsSoFar, "the next resolve asks the Hub rather than trusting the old manifest")
+        #expect(!fixture.manifest.contains("*.mvn"))
+    }
+
+    @Test func aRepositoryTheHubNoLongerHasThatAnswersLateIsNotRetriedForAWhile() async throws {
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("model.safetensors", "file")], cachedCommit: true,
+            notFoundRevisions: [ListingFixture.commit, "main"], listingFailsAfter: 1.5)
+        defer { fixture.cleanUp() }
+
+        // Two late 404s (the commit, then main): three seconds every cold load
+        // would pay under the lock, so the pair is remembered like a timeout.
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(fixture.listingCount == 2)
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(fixture.listingCount == 2, "a 404 pair that took seconds is not asked about again at once")
     }
 
     @Test func aFreshFetchWithAPatternCertifiesItOnceItsFilesAreOnDisk() async throws {
