@@ -145,11 +145,15 @@ public enum ModelUtils {
         // were never fetched. One request, bounded in time and not repeated
         // for a while after it fails, taken at most once per snapshot and set
         // of patterns while the Hub answers; afterwards the hit above answers.
-        let listing = await listRepository(repoID, client: client, revision: revision)
+        // Only when there is something to certify: a fresh fetch of the default
+        // patterns alone has no pattern to record, and a listing that fails
+        // there would otherwise be remembered against the loader's resolve
+        // that follows it.
+        let needsListing = usableSnapshot || !requested.subtracting(defaults).isEmpty
+        let listed = needsListing ? await listRepository(repoID, client: client, revision: revision) : nil
         try Task.checkCancellation()
-        let progress: @MainActor @Sendable (Progress) -> Void = progressHandler ?? { progress in
-            print("\(progress.completedUnitCount)/\(progress.totalUnitCount) files")
-        }
+        let listing = listed?.entries
+        let fetchRevision = listed?.revision ?? revision
 
         let fetched: Set<String>
         if usableSnapshot {
@@ -167,6 +171,13 @@ public enum ModelUtils {
             let wanted = listing.filter { entry in
                 entry.type == .file && missing.contains { fnmatch($0, entry.path, 0) == 0 }
             }
+            // A listing comes from the network: a path that leaves the model
+            // directory (`tokenizer/../../x` matches `tokenizer*`, since `*`
+            // matches `/`) is refused outright, as the snapshot download
+            // refuses it, rather than written where it points.
+            for entry in wanted {
+                try Self.validateEntryPath(entry.path, under: modelDir)
+            }
             let absent = wanted.filter { !FileManager.default.fileExists(atPath: modelDir.appendingPathComponent($0.path).path) }
             if !absent.isEmpty {
                 print("Fetching \(absent.count) file(s) for \(repoID): \(absent.map(\.path).sorted().joined(separator: ", "))...")
@@ -176,7 +187,7 @@ public enum ModelUtils {
                         from: repoID,
                         to: modelDir.appendingPathComponent(entry.path),
                         kind: .model,
-                        revision: revision
+                        revision: fetchRevision
                     )
                 }
             }
@@ -190,6 +201,9 @@ public enum ModelUtils {
             print("Model ready at: \(modelDir.path)")
         } else {
             let patterns = defaults.union(requested).union(recorded)
+            let progress: @MainActor @Sendable (Progress) -> Void = progressHandler ?? { progress in
+                print("\(progress.completedUnitCount)/\(progress.totalUnitCount) files")
+            }
             print("Downloading model \(repoID)...")
             _ = try await client.downloadSnapshot(
                 of: repoID,
@@ -199,6 +213,8 @@ public enum ModelUtils {
                 matching: Array(patterns),
                 progressHandler: progress
             )
+            // The Hub answered: a listing that failed earlier is forgotten.
+            failedListings.withLock { _ = $0.removeValue(forKey: repoID.description) }
 
             // Post-download validation: ensure required files are non-zero
             let downloadedFiles = try? FileManager.default.contentsOfDirectory(
@@ -229,7 +245,7 @@ public enum ModelUtils {
     /// The Hub host, `HF_ENDPOINT` or huggingface.co: what `HubClient` picks
     /// on its own when no token is given, applied to the token client too so
     /// a mirror user is not sent to huggingface.co for one of the two.
-    private static var hubHost: URL {
+    public static var hubHost: URL {
         if let endpoint = ProcessInfo.processInfo.environment["HF_ENDPOINT"],
            let url = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)) {
             return url
@@ -267,30 +283,87 @@ public enum ModelUtils {
         failedListings.withLock { $0.removeAll() }
     }
 
+    /// A listing and the revision it was made at.
+    struct Listing {
+        let entries: [Git.TreeEntry]
+        let revision: String
+    }
+
+    private enum ListingAttempt {
+        case listed([Git.TreeEntry])
+        case notFound
+        case failed
+    }
+
+    private static func attemptListing(
+        _ repoID: Repo.ID, client: HubClient, revision: String
+    ) async -> ListingAttempt {
+        await withTaskGroup(of: ListingAttempt.self) { group in
+            group.addTask {
+                do {
+                    return .listed(try await client.listFiles(in: repoID, kind: .model, revision: revision, recursive: true))
+                } catch let error as HTTPClientError {
+                    if case .responseError(let response, _) = error, response.statusCode == 404 {
+                        return .notFound
+                    }
+                    return .failed
+                } catch {
+                    return .failed
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(for: listingTimeout)
+                return .failed
+            }
+            let first = await group.next() ?? .failed
+            group.cancelAll()
+            return first
+        }
+    }
+
     private static func listRepository(
         _ repoID: Repo.ID, client: HubClient, revision: String
-    ) async -> [Git.TreeEntry]? {
+    ) async -> Listing? {
         let key = repoID.description
         if let failedAt = failedListings.withLock({ $0[key] }),
            Date().timeIntervalSince(failedAt) < listingRetryInterval {
             return nil
         }
-        let listing: [Git.TreeEntry]? = await withTaskGroup(of: [Git.TreeEntry]?.self) { group in
-            group.addTask {
-                try? await client.listFiles(in: repoID, kind: .model, revision: revision, recursive: true)
-            }
-            group.addTask {
-                try? await Task.sleep(for: listingTimeout)
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
+        var attempt = await attemptListing(repoID, client: client, revision: revision)
+        var usedRevision = revision
+        // A cached commit the Hub no longer has (a re-upload, a force-push):
+        // the snapshot is completed from `main` instead of never.
+        if case .notFound = attempt, revision != "main" {
+            attempt = await attemptListing(repoID, client: client, revision: "main")
+            usedRevision = "main"
         }
-        failedListings.withLock {
-            if listing == nil { $0[key] = Date() } else { $0.removeValue(forKey: key) }
+        // A caller that was cancelled got no answer; that is not the Hub's.
+        if Task.isCancelled { return nil }
+        switch attempt {
+        case .listed(let entries):
+            failedListings.withLock { _ = $0.removeValue(forKey: key) }
+            return Listing(entries: entries, revision: usedRevision)
+        case .notFound, .failed:
+            failedListings.withLock { $0[key] = Date() }
+            return nil
         }
-        return listing
+    }
+
+    /// The rule the snapshot download applies to every listed path, plus the
+    /// check that the destination stays inside `modelDir`.
+    static func validateEntryPath(_ path: String, under modelDir: URL) throws {
+        guard !path.trimmingCharacters(in: .whitespaces).isEmpty,
+              !path.contains("\0"), !path.contains("\\"), !path.hasPrefix("/"),
+              path.split(separator: "/", omittingEmptySubsequences: false)
+                  .allSatisfy({ !$0.isEmpty && $0 != ".." })
+        else {
+            throw ModelUtilsError.unsafeEntryPath(path)
+        }
+        let root = modelDir.standardizedFileURL.path
+        let destination = modelDir.appendingPathComponent(path).standardizedFileURL.path
+        guard destination.hasPrefix(root + "/") else {
+            throw ModelUtilsError.unsafeEntryPath(path)
+        }
     }
 
     /// Patterns every snapshot download includes regardless of caller-supplied
@@ -339,12 +412,16 @@ public enum ModelUtils {
 
 public enum ModelUtilsError: LocalizedError {
     case incompleteDownload(String)
+    /// The Hub listed a path that would leave the model directory.
+    case unsafeEntryPath(String)
 
     public var errorDescription: String? {
         switch self {
         case .incompleteDownload(let repo):
             return "Downloaded model '\(repo)' has missing or zero-byte weight files. "
                 + "The cache has been cleared — please try again."
+        case .unsafeEntryPath(let path):
+            return "The repository listing names a file outside the model directory: '\(path)'."
         }
     }
 }
