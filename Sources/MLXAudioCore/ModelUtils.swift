@@ -166,7 +166,15 @@ public enum ModelUtils {
         }
 
         print("Model downloaded to: \(modelDir.path)")
-        recordPatterns(modelDir: modelDir, patterns: effectivePatterns)
+        // Certify only the patterns the snapshot now satisfies. The Hub client
+        // serves the cached snapshot when the listing cannot be fetched, so a
+        // pattern cannot be recorded merely because it was asked for: offline,
+        // that would mark files as present that were never downloaded, and no
+        // later online load would fetch them. A pattern that matches nothing
+        // (a repo without the optional file) is never recorded and is checked
+        // against the listing again on the next load.
+        let present = patternsSatisfied(in: modelDir, among: effectivePatterns)
+        recordPatterns(modelDir: modelDir, patterns: (recordedPatterns(modelDir: modelDir) ?? []).union(present))
         return modelDir
     }
 
@@ -195,6 +203,16 @@ public enum ModelUtils {
               let text = String(data: data, encoding: .utf8)
         else { return nil }
         return Set(text.split(separator: "\n").map(String.init))
+    }
+
+    /// The subset of `patterns` that matches at least one file under
+    /// `modelDir`, matched the way the Hub client matches a snapshot listing
+    /// (`fnmatch` against the path relative to the snapshot root).
+    private static func patternsSatisfied(in modelDir: URL, among patterns: Set<String>) -> Set<String> {
+        let paths = (try? FileManager.default.subpathsOfDirectory(atPath: modelDir.path)) ?? []
+        return patterns.filter { pattern in
+            paths.contains { fnmatch(pattern, $0, 0) == 0 }
+        }
     }
 
     private static func recordPatterns(modelDir: URL, patterns: Set<String>) {
