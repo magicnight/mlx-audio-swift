@@ -1,5 +1,6 @@
 import Foundation
 import HuggingFace
+import os
 
 public enum ModelUtils {
     public static func resolveModelType(
@@ -40,7 +41,7 @@ public enum ModelUtils {
         let client: HubClient
         if let token = hfToken, !token.isEmpty {
             print("Using HuggingFace token from configuration")
-            client = HubClient(host: HubClient.defaultHost, bearerToken: token, cache: cache)
+            client = HubClient(host: Self.hubHost, bearerToken: token, cache: cache)
         } else {
             client = HubClient(cache: cache)
         }
@@ -89,7 +90,8 @@ public enum ModelUtils {
         // no additional patterns, so a later load that needs e.g. "*.mvn"
         // would otherwise silently get a partial snapshot. Default patterns
         // ("*.json", "*.safetensors", ...) come with every fetch and count as
-        // covered without a manifest entry.
+        // covered without a manifest entry, and so does a pattern that names
+        // one file (no glob characters) that is on disk.
         var usableSnapshot = false
         if FileManager.default.fileExists(atPath: modelDir.path) {
             let files = try? FileManager.default.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: [.fileSizeKey])
@@ -105,7 +107,7 @@ public enum ModelUtils {
                 if FileManager.default.fileExists(atPath: configPath.path) {
                     if let configData = try? Data(contentsOf: configPath),
                        let _ = try? JSONSerialization.jsonObject(with: configData) {
-                        if requested.isSubset(of: recorded.union(defaults)) {
+                        if uncoveredPatterns(requested, recorded: recorded, defaults: defaults, in: modelDir).isEmpty {
                             print("Using cached model at: \(modelDir.path)")
                             return modelDir
                         }
@@ -127,48 +129,65 @@ public enum ModelUtils {
         // Create directory if needed
         try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
 
+        // The revision the cached snapshot came from, so the listing and the
+        // files fetched to complete it match the weights already on disk; a
+        // fresh snapshot follows `main`.
+        let revision = usableSnapshot
+            ? (cache.resolveRevision(repo: repoID, kind: .model, ref: "main") ?? "main")
+            : "main"
+
         // Ask the Hub what the patterns name. The listing is what lets a
         // pattern be recorded as complete: a pattern the repo has no file for
         // is complete the moment the Hub says so (Whisper asks for "*.model";
         // no Whisper repo has one), and the Hub client serves the cached
         // snapshot when it cannot list, so without a listing nothing new may
         // be recorded, or an offline load would mark files as present that
-        // were never fetched. One request, taken at most once per snapshot
-        // and set of patterns while online; afterwards the hit above answers.
-        let listing = try? await client.listFiles(in: repoID, kind: .model, revision: "main", recursive: true)
+        // were never fetched. One request, bounded in time and not repeated
+        // for a while after it fails, taken at most once per snapshot and set
+        // of patterns while the Hub answers; afterwards the hit above answers.
+        let listing = await listRepository(repoID, client: client, revision: revision)
+        try Task.checkCancellation()
         let progress: @MainActor @Sendable (Progress) -> Void = progressHandler ?? { progress in
             print("\(progress.completedUnitCount)/\(progress.totalUnitCount) files")
         }
 
         let fetched: Set<String>
         if usableSnapshot {
-            // The weights are here; fetch only what the uncovered patterns
-            // name, into the same directory, so nothing already present is
-            // downloaded or copied again. With no listing (offline) the
-            // snapshot is served as it is, uncertified: the loader finds out
-            // whether the files it wants are there, as it always did.
-            let missing = requested.subtracting(recorded.union(defaults))
+            // The weights are here; fetch only the listed files the uncovered
+            // patterns name that are not on disk, one by one into the same
+            // directory, so nothing already present is downloaded, listed or
+            // copied again. With no listing (offline) the snapshot is served
+            // as it is, uncertified: the loader finds out whether the files it
+            // wants are there, as it always did.
+            let missing = uncoveredPatterns(requested, recorded: recorded, defaults: defaults, in: modelDir)
             guard let listing else {
                 print("Using cached model at: \(modelDir.path) (the Hub could not be asked for \(missing.sorted().joined(separator: ", ")))")
                 return modelDir
             }
-            let absent = listing.filter { entry in
-                entry.type == .file
-                    && missing.contains { fnmatch($0, entry.path, 0) == 0 }
-                    && !FileManager.default.fileExists(atPath: modelDir.appendingPathComponent(entry.path).path)
+            let wanted = listing.filter { entry in
+                entry.type == .file && missing.contains { fnmatch($0, entry.path, 0) == 0 }
             }
+            let absent = wanted.filter { !FileManager.default.fileExists(atPath: modelDir.appendingPathComponent($0.path).path) }
             if !absent.isEmpty {
-                print("Fetching \(absent.count) file(s) for \(repoID): \(missing.sorted().joined(separator: ", "))...")
-                _ = try await client.downloadSnapshot(
-                    of: repoID,
-                    kind: .model,
-                    to: modelDir,
-                    revision: "main",
-                    matching: Array(missing),
-                    progressHandler: progress
-                )
+                print("Fetching \(absent.count) file(s) for \(repoID): \(absent.map(\.path).sorted().joined(separator: ", "))...")
+                for entry in absent {
+                    _ = try await client.downloadFile(
+                        entry,
+                        from: repoID,
+                        to: modelDir.appendingPathComponent(entry.path),
+                        kind: .model,
+                        revision: revision
+                    )
+                }
             }
-            fetched = missing
+            // Record only what is now on disk: a pattern whose listed files
+            // still are not there (a fetch that returned without them) is
+            // asked about again next time.
+            let incomplete = wanted.filter { !FileManager.default.fileExists(atPath: modelDir.appendingPathComponent($0.path).path) }
+            fetched = missing.filter { pattern in
+                !incomplete.contains { fnmatch(pattern, $0.path, 0) == 0 }
+            }
+            print("Model ready at: \(modelDir.path)")
         } else {
             let patterns = defaults.union(requested).union(recorded)
             print("Downloading model \(repoID)...")
@@ -176,35 +195,102 @@ public enum ModelUtils {
                 of: repoID,
                 kind: .model,
                 to: modelDir,
-                revision: "main",
+                revision: revision,
                 matching: Array(patterns),
                 progressHandler: progress
             )
+
+            // Post-download validation: ensure required files are non-zero
+            let downloadedFiles = try? FileManager.default.contentsOfDirectory(
+                at: modelDir, includingPropertiesForKeys: [.fileSizeKey]
+            )
+            let hasValidFile = downloadedFiles?.contains { file in
+                guard file.pathExtension == normalizedRequiredExtension else { return false }
+                let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                return size > 0
+            } ?? false
+
+            if !hasValidFile {
+                Self.clearCaches(modelDir: modelDir, repoID: repoID, hubCache: cache)
+                throw ModelUtilsError.incompleteDownload(repoID.description)
+            }
+            print("Model downloaded to: \(modelDir.path)")
             fetched = requested.union(recorded)
         }
 
-        // Post-download validation: ensure required files are non-zero
-        let downloadedFiles = try? FileManager.default.contentsOfDirectory(
-            at: modelDir, includingPropertiesForKeys: [.fileSizeKey]
-        )
-        let hasValidFile = downloadedFiles?.contains { file in
-            guard file.pathExtension == normalizedRequiredExtension else { return false }
-            let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-            return size > 0
-        } ?? false
-
-        if !hasValidFile {
-            Self.clearCaches(modelDir: modelDir, repoID: repoID, hubCache: cache)
-            throw ModelUtilsError.incompleteDownload(repoID.description)
-        }
-
-        print("Model downloaded to: \(modelDir.path)")
         // Only a listing proves the patterns are complete; a download that the
         // client served from its own cache proves nothing about them.
         if listing != nil {
             recordPatterns(modelDir: modelDir, patterns: recorded.union(fetched))
         }
         return modelDir
+    }
+
+    /// The Hub host, `HF_ENDPOINT` or huggingface.co: what `HubClient` picks
+    /// on its own when no token is given, applied to the token client too so
+    /// a mirror user is not sent to huggingface.co for one of the two.
+    private static var hubHost: URL {
+        if let endpoint = ProcessInfo.processInfo.environment["HF_ENDPOINT"],
+           let url = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return url
+        }
+        return HubClient.defaultHost
+    }
+
+    /// The requested patterns a snapshot is not known to be complete for: not
+    /// among the patterns it was fetched with, not a default every fetch
+    /// includes, and not a single-file name (no glob characters) whose file
+    /// is on disk.
+    private static func uncoveredPatterns(
+        _ requested: Set<String>, recorded: Set<String>, defaults: Set<String>, in modelDir: URL
+    ) -> Set<String> {
+        requested.filter { pattern in
+            if recorded.contains(pattern) || defaults.contains(pattern) { return false }
+            let isLiteral = !pattern.contains { "*?[".contains($0) }
+            if isLiteral, FileManager.default.fileExists(atPath: modelDir.appendingPathComponent(pattern).path) {
+                return false
+            }
+            return true
+        }
+    }
+
+    /// Repos whose listing failed, with when. A network that drops packets
+    /// rather than refusing them costs a cold load one attempt of at most
+    /// `listingTimeout`, and the next cold loads of that repo nothing for
+    /// `listingRetryInterval`, instead of a minute per resolve.
+    private static let failedListings = OSAllocatedUnfairLock<[String: Date]>(initialState: [:])
+    static let listingTimeout: Duration = .seconds(10)
+    static let listingRetryInterval: TimeInterval = 600
+
+    /// Test seam: forget which repos could not be listed.
+    static func forgetFailedListings() {
+        failedListings.withLock { $0.removeAll() }
+    }
+
+    private static func listRepository(
+        _ repoID: Repo.ID, client: HubClient, revision: String
+    ) async -> [Git.TreeEntry]? {
+        let key = repoID.description
+        if let failedAt = failedListings.withLock({ $0[key] }),
+           Date().timeIntervalSince(failedAt) < listingRetryInterval {
+            return nil
+        }
+        let listing: [Git.TreeEntry]? = await withTaskGroup(of: [Git.TreeEntry]?.self) { group in
+            group.addTask {
+                try? await client.listFiles(in: repoID, kind: .model, revision: revision, recursive: true)
+            }
+            group.addTask {
+                try? await Task.sleep(for: listingTimeout)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        failedListings.withLock {
+            if listing == nil { $0[key] = Date() } else { $0.removeValue(forKey: key) }
+        }
+        return listing
     }
 
     /// Patterns every snapshot download includes regardless of caller-supplied
