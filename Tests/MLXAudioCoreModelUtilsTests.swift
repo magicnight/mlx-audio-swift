@@ -62,6 +62,9 @@ private final class ListingProtocol: URLProtocol, @unchecked Sendable {
     /// request whose `cursor` query item is `n` (the first request has none)
     /// and links to page `n + 1` in a `Link` header while there is one.
     static let pages = OSAllocatedUnfairLock(initialState: [String: [Data]]())
+    /// Per host, the status a paged listing answers for a page (by cursor)
+    /// instead of 200: a later page that fails or is missing.
+    static let pageStatuses = OSAllocatedUnfairLock(initialState: [String: [Int: Int]]())
     static let served = OSAllocatedUnfairLock(initialState: [String: [String: Data]]())
     static let listingCounts = OSAllocatedUnfairLock(initialState: [String: Int]())
     static let listingPaths = OSAllocatedUnfairLock(initialState: [String: [String]]())
@@ -114,10 +117,10 @@ private final class ListingProtocol: URLProtocol, @unchecked Sendable {
         }
         if url.path.contains("/tree/"),
            let pages = Self.pages.withLock({ $0[host] }) {
-            Self.listingCounts.withLock { $0[host, default: 0] += 1 }
-            Self.listingPaths.withLock { $0[host, default: []].append(url.path) }
             let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
             let cursor = components?.queryItems?.first { $0.name == "cursor" }?.value.flatMap(Int.init) ?? 0
+            Self.listingCounts.withLock { $0[host, default: 0] += 1 }
+            Self.listingPaths.withLock { $0[host, default: []].append(url.path + (cursor > 0 ? "?cursor=\(cursor)" : "")) }
             var headers = ["Content-Type": "application/json"]
             if cursor + 1 < pages.count, var next = components {
                 next.queryItems = (next.queryItems ?? []).filter { $0.name != "cursor" }
@@ -126,11 +129,12 @@ private final class ListingProtocol: URLProtocol, @unchecked Sendable {
                     headers["Link"] = "<\(nextURL.absoluteString)>; rel=\"next\""
                 }
             }
+            let status = Self.pageStatuses.withLock { $0[host]?[cursor] } ?? (cursor < pages.count ? 200 : 404)
             let response = HTTPURLResponse(
-                url: url, statusCode: cursor < pages.count ? 200 : 404, httpVersion: "HTTP/1.1",
+                url: url, statusCode: status, httpVersion: "HTTP/1.1",
                 headerFields: headers)!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            if cursor < pages.count {
+            if status == 200 {
                 client?.urlProtocol(self, didLoad: pages[cursor])
             }
             client?.urlProtocolDidFinishLoading(self)
@@ -216,7 +220,8 @@ private struct ListingFixture {
         cachedCommit: Bool = false, populated: Bool = true, hangs: Bool = false,
         notFoundRevisions: Set<String> = [], failAfterListings: Int? = nil,
         listingFailsAfter: TimeInterval? = nil,
-        pageSize: Int? = nil
+        pageSize: Int? = nil,
+        pageStatuses: [Int: Int] = [:]
     ) throws {
         ModelUtils.forgetSlowListingFailures()
         root = try makeTemporaryCacheDirectory()
@@ -240,10 +245,14 @@ private struct ListingFixture {
         let entries = files.map { ["type": $0.1, "path": $0.0, "oid": "0", "size": 1] as [String: Any] }
         let hostName = listingHost.host!
         if let pageSize {
+            precondition(pageSize > 0, "a page holds at least one entry")
             let pages = try stride(from: 0, to: max(entries.count, 1), by: pageSize).map { start in
                 try JSONSerialization.data(withJSONObject: Array(entries[start..<min(start + pageSize, entries.count)]))
             }
             ListingProtocol.pages.withLock { $0[hostName] = pages }
+            if !pageStatuses.isEmpty {
+                ListingProtocol.pageStatuses.withLock { $0[hostName] = pageStatuses }
+            }
         } else {
             let body = try JSONSerialization.data(withJSONObject: entries)
             ListingProtocol.listings.withLock { $0[hostName] = body }
@@ -297,6 +306,7 @@ private struct ListingFixture {
         session.invalidateAndCancel()
         ListingProtocol.listings.withLock { _ = $0.removeValue(forKey: host.host!) }
         ListingProtocol.pages.withLock { _ = $0.removeValue(forKey: host.host!) }
+        ListingProtocol.pageStatuses.withLock { _ = $0.removeValue(forKey: host.host!) }
         ListingProtocol.served.withLock { _ = $0.removeValue(forKey: host.host!) }
         ListingProtocol.listingCounts.withLock { _ = $0.removeValue(forKey: host.host!) }
         ListingProtocol.listingPaths.withLock { _ = $0.removeValue(forKey: host.host!) }
@@ -620,13 +630,13 @@ struct ModelUtilsCacheTests {
     }
 
     @Test func aListingAcrossPagesIsReadToItsEnd() async throws {
-        // The Hub pages tree listings. A file named only on the second page
-        // must still be found: with the single-request listing, `*.mvn`
-        // matched nothing on the first page and was recorded as complete
-        // without a fetch.
+        // The Hub pages tree listings. A pattern's file on each page must be
+        // found: with the single-request listing, `*.mvn` saw only the first
+        // page; an implementation that keeps only the last page would miss
+        // a.mvn.
         let fixture = try ListingFixture(
-            files: [("config.json", "file"), ("model.safetensors", "file"), ("am.mvn", "file")],
-            served: ["am.mvn": Data("mvn bytes".utf8)], pageSize: 2)
+            files: [("config.json", "file"), ("a.mvn", "file"), ("model.safetensors", "file"), ("b.mvn", "file")],
+            served: ["a.mvn": Data("a".utf8), "b.mvn": Data("b".utf8)], pageSize: 2)
         defer { fixture.cleanUp() }
 
         _ = try await ModelUtils.resolveOrDownloadModel(
@@ -637,8 +647,88 @@ struct ModelUtilsCacheTests {
             additionalMatchingPatterns: ["*.mvn"]
         )
         #expect(fixture.listingCount == 2, "both pages were asked for: \(fixture.listingPaths)")
-        #expect(fixture.otherRequests.contains { $0.hasSuffix("/am.mvn") }, "the file only the second page names is fetched: \(fixture.otherRequests)")
-        #expect(FileManager.default.fileExists(atPath: fixture.modelDir.appendingPathComponent("am.mvn").path))
+        for file in ["a.mvn", "b.mvn"] {
+            #expect(fixture.otherRequests.contains { $0.hasSuffix("/\(file)") }, "\(file) is fetched: \(fixture.otherRequests)")
+            #expect(FileManager.default.fileExists(atPath: fixture.modelDir.appendingPathComponent(file).path), "\(file) is on disk")
+        }
+        #expect(fixture.manifest.contains("*.mvn"))
+    }
+
+    @Test func aLaterPageThatFailsCertifiesNothing() async throws {
+        // A listing that fails part-way is no listing: nothing is fetched
+        // from the pages that did come, and nothing is recorded.
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("a.mvn", "file"), ("model.safetensors", "file"), ("b.mvn", "file")],
+            served: ["a.mvn": Data("a".utf8), "b.mvn": Data("b".utf8)], pageSize: 2, pageStatuses: [1: 500])
+        defer { fixture.cleanUp() }
+
+        let resolved = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(resolved.standardizedFileURL == fixture.modelDir.standardizedFileURL, "the snapshot is served as it is")
+        #expect(fixture.listingCount == 2, "the first page and the one that failed: \(fixture.listingPaths)")
+        #expect(fixture.otherRequestCount == 0, "nothing is fetched from a partial listing: \(fixture.otherRequests)")
+        #expect(!fixture.manifest.contains("*.mvn"), "nothing is certified by a partial listing")
+    }
+
+    @Test func aLaterPageMissingAtTheCachedCommitIsAFailureNotAFallbackToMain() async throws {
+        // Only the first page can say the Hub no longer has the cached
+        // commit; a 404 on a later page, after the first page proved the
+        // commit is there, ends the listing as failed and does not send it
+        // to `main`.
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("a.mvn", "file"), ("model.safetensors", "file"), ("b.mvn", "file")],
+            served: ["a.mvn": Data("a".utf8), "b.mvn": Data("b".utf8)], cachedCommit: true,
+            pageSize: 2, pageStatuses: [1: 404])
+        defer { fixture.cleanUp() }
+
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(fixture.listingCount == 2, "the two pages at the cached commit and nothing more: \(fixture.listingPaths)")
+        #expect(!fixture.listingPaths.contains { $0.contains("/tree/main") }, "not re-listed at main: \(fixture.listingPaths)")
+        #expect(fixture.otherRequestCount == 0, "nothing is fetched: \(fixture.otherRequests)")
+        #expect(!fixture.manifest.contains("*.mvn"))
+    }
+
+    @Test func aFreshFetchOfAPagedRepositoryCompletesOnTheNextResolve() async throws {
+        // The snapshot download's own listing is the library's single
+        // request, so a fresh fetch brings the first page's files only. The
+        // pattern whose file sits on the second page is left uncertified,
+        // and the next resolve, which lists every page, completes it.
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("model.safetensors", "file"), ("am.mvn", "file")],
+            served: ["config.json": Data("{}".utf8), "model.safetensors": Data([0x01]), "am.mvn": Data("mvn".utf8)],
+            populated: false, pageSize: 2)
+        defer { fixture.cleanUp() }
+
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(FileManager.default.fileExists(atPath: fixture.modelDir.appendingPathComponent("model.safetensors").path))
+        #expect(!FileManager.default.fileExists(atPath: fixture.modelDir.appendingPathComponent("am.mvn").path), "the download brought the first page's files")
+        #expect(!fixture.manifest.contains("*.mvn"), "a pattern whose listed file did not come is not certified")
+
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(FileManager.default.fileExists(atPath: fixture.modelDir.appendingPathComponent("am.mvn").path), "completed by the next resolve")
         #expect(fixture.manifest.contains("*.mvn"))
     }
 

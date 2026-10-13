@@ -152,13 +152,16 @@ public enum ModelUtils {
         // be recorded, or an offline load would mark files as present that
         // were never fetched. One listing, every page of it, bounded in time
         // as a whole (a second listing when the Hub no longer has the cached
-        // commit and `main` is tried), not repeated
-        // for a while after it ran out of time or took seconds to fail, and
-        // taken at most once per snapshot and set of patterns while the Hub
-        // answers; afterwards the hit above answers. Only when there is
-        // something to certify: a fresh fetch of the default patterns alone
-        // has no pattern to record (a usable snapshot that fell through has
-        // one by construction).
+        // commit and `main` is tried), not repeated for a while after it ran
+        // out of time or took seconds to fail, and taken at most once per
+        // snapshot and set of patterns while the Hub answers; afterwards the
+        // hit above answers. Only when there is something to certify: a
+        // fresh fetch of the default patterns alone has no pattern to record
+        // (a usable snapshot that fell through has one by construction). The
+        // snapshot download's own listing is still the library's single
+        // request, so a fresh fetch of a repository past one page brings the
+        // first page's files; a pattern whose listed files it did not bring
+        // is left uncertified and completed on the next resolve.
         let needsListing = !requested.subtracting(defaults).isEmpty
         let listed = needsListing ? await listRepository(repoID, client: client, revision: revision) : nil
         try Task.checkCancellation()
@@ -333,23 +336,33 @@ public enum ModelUtils {
     ) async -> ListingAttempt {
         await withTaskGroup(of: ListingAttempt.self) { group in
             group.addTask {
+                // Every page: the Hub pages tree listings, and the
+                // single-request `listFiles` returns only the first, so a
+                // repository past one page would be certified against a
+                // partial listing and a pattern that only the later pages
+                // name would be recorded as having no file. Only the first
+                // page tells "not found" from "failed": a later page that
+                // fails, 404 included, or a link the client refuses (a mirror
+                // whose pages point elsewhere) ends the whole listing as
+                // failed, never as a partial one and never as a reason to
+                // try `main`.
+                let pages: Pages<Git.TreeEntry>
                 do {
-                    // Every page: the Hub pages tree listings, and the
-                    // single-request `listFiles` returns only the first, so
-                    // a repository past one page would be certified against
-                    // a partial listing and a pattern that only the later
-                    // pages name would be recorded as having no file.
-                    var entries: [Git.TreeEntry] = []
-                    let pages = try await client.listAllTree(in: repoID, kind: .model, revision: revision, recursive: true)
-                    for try await page in pages {
-                        entries.append(contentsOf: page.items)
-                    }
-                    return .listed(entries)
+                    pages = try await client.listAllTree(in: repoID, kind: .model, revision: revision, recursive: true)
                 } catch let error as HTTPClientError {
                     if case .responseError(let response, _) = error, response.statusCode == 404 {
                         return .notFound
                     }
                     return .failed
+                } catch {
+                    return .failed
+                }
+                do {
+                    var entries: [Git.TreeEntry] = []
+                    for try await page in pages {
+                        entries.append(contentsOf: page.items)
+                    }
+                    return .listed(entries)
                 } catch {
                     return .failed
                 }
