@@ -58,6 +58,10 @@ private final class OfflineCacheProtocol: URLProtocol, @unchecked Sendable {
 /// what a pattern names and hands out exactly the files a test allows.
 private final class ListingProtocol: URLProtocol, @unchecked Sendable {
     static let listings = OSAllocatedUnfairLock(initialState: [String: Data]())
+    /// Per host, a listing served one page per request: page `n` answers a
+    /// request whose `cursor` query item is `n` (the first request has none)
+    /// and links to page `n + 1` in a `Link` header while there is one.
+    static let pages = OSAllocatedUnfairLock(initialState: [String: [Data]]())
     static let served = OSAllocatedUnfairLock(initialState: [String: [String: Data]]())
     static let listingCounts = OSAllocatedUnfairLock(initialState: [String: Int]())
     static let listingPaths = OSAllocatedUnfairLock(initialState: [String: [String]]())
@@ -106,6 +110,30 @@ private final class ListingProtocol: URLProtocol, @unchecked Sendable {
                     self.client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
                 }
             }
+            return
+        }
+        if url.path.contains("/tree/"),
+           let pages = Self.pages.withLock({ $0[host] }) {
+            Self.listingCounts.withLock { $0[host, default: 0] += 1 }
+            Self.listingPaths.withLock { $0[host, default: []].append(url.path) }
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            let cursor = components?.queryItems?.first { $0.name == "cursor" }?.value.flatMap(Int.init) ?? 0
+            var headers = ["Content-Type": "application/json"]
+            if cursor + 1 < pages.count, var next = components {
+                next.queryItems = (next.queryItems ?? []).filter { $0.name != "cursor" }
+                    + [URLQueryItem(name: "cursor", value: String(cursor + 1))]
+                if let nextURL = next.url {
+                    headers["Link"] = "<\(nextURL.absoluteString)>; rel=\"next\""
+                }
+            }
+            let response = HTTPURLResponse(
+                url: url, statusCode: cursor < pages.count ? 200 : 404, httpVersion: "HTTP/1.1",
+                headerFields: headers)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            if cursor < pages.count {
+                client?.urlProtocol(self, didLoad: pages[cursor])
+            }
+            client?.urlProtocolDidFinishLoading(self)
             return
         }
         if url.path.contains("/tree/"),
@@ -187,7 +215,8 @@ private struct ListingFixture {
         files: [(String, String)], served: [String: Data] = [:],
         cachedCommit: Bool = false, populated: Bool = true, hangs: Bool = false,
         notFoundRevisions: Set<String> = [], failAfterListings: Int? = nil,
-        listingFailsAfter: TimeInterval? = nil
+        listingFailsAfter: TimeInterval? = nil,
+        pageSize: Int? = nil
     ) throws {
         ModelUtils.forgetSlowListingFailures()
         root = try makeTemporaryCacheDirectory()
@@ -209,9 +238,16 @@ private struct ListingFixture {
             ListingProtocol.hanging.withLock { _ = $0.insert(listingHost.host!) }
         }
         let entries = files.map { ["type": $0.1, "path": $0.0, "oid": "0", "size": 1] as [String: Any] }
-        let body = try JSONSerialization.data(withJSONObject: entries)
         let hostName = listingHost.host!
-        ListingProtocol.listings.withLock { $0[hostName] = body }
+        if let pageSize {
+            let pages = try stride(from: 0, to: max(entries.count, 1), by: pageSize).map { start in
+                try JSONSerialization.data(withJSONObject: Array(entries[start..<min(start + pageSize, entries.count)]))
+            }
+            ListingProtocol.pages.withLock { $0[hostName] = pages }
+        } else {
+            let body = try JSONSerialization.data(withJSONObject: entries)
+            ListingProtocol.listings.withLock { $0[hostName] = body }
+        }
         ListingProtocol.served.withLock { $0[hostName] = served }
         if !notFoundRevisions.isEmpty {
             ListingProtocol.notFoundRevisions.withLock { $0[hostName] = notFoundRevisions }
@@ -260,6 +296,7 @@ private struct ListingFixture {
     func cleanUp() {
         session.invalidateAndCancel()
         ListingProtocol.listings.withLock { _ = $0.removeValue(forKey: host.host!) }
+        ListingProtocol.pages.withLock { _ = $0.removeValue(forKey: host.host!) }
         ListingProtocol.served.withLock { _ = $0.removeValue(forKey: host.host!) }
         ListingProtocol.listingCounts.withLock { _ = $0.removeValue(forKey: host.host!) }
         ListingProtocol.listingPaths.withLock { _ = $0.removeValue(forKey: host.host!) }
@@ -579,6 +616,29 @@ struct ModelUtilsCacheTests {
         let refs = (try? FileManager.default.contentsOfDirectory(
             atPath: fixture.cache.refsDirectory(repo: fixture.repoID, kind: .model).path)) ?? []
         #expect(refs == ["main"], "no ref is written for the commit itself: \(refs)")
+        #expect(fixture.manifest.contains("*.mvn"))
+    }
+
+    @Test func aListingAcrossPagesIsReadToItsEnd() async throws {
+        // The Hub pages tree listings. A file named only on the second page
+        // must still be found: with the single-request listing, `*.mvn`
+        // matched nothing on the first page and was recorded as complete
+        // without a fetch.
+        let fixture = try ListingFixture(
+            files: [("config.json", "file"), ("model.safetensors", "file"), ("am.mvn", "file")],
+            served: ["am.mvn": Data("mvn bytes".utf8)], pageSize: 2)
+        defer { fixture.cleanUp() }
+
+        _ = try await ModelUtils.resolveOrDownloadModel(
+            client: fixture.client,
+            cache: fixture.cache,
+            repoID: fixture.repoID,
+            requiredExtension: "safetensors",
+            additionalMatchingPatterns: ["*.mvn"]
+        )
+        #expect(fixture.listingCount == 2, "both pages were asked for: \(fixture.listingPaths)")
+        #expect(fixture.otherRequests.contains { $0.hasSuffix("/am.mvn") }, "the file only the second page names is fetched: \(fixture.otherRequests)")
+        #expect(FileManager.default.fileExists(atPath: fixture.modelDir.appendingPathComponent("am.mvn").path))
         #expect(fixture.manifest.contains("*.mvn"))
     }
 

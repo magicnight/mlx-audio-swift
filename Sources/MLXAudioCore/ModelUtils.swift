@@ -150,8 +150,9 @@ public enum ModelUtils {
         // no Whisper repo has one), and the Hub client serves the cached
         // snapshot when it cannot list, so without a listing nothing new may
         // be recorded, or an offline load would mark files as present that
-        // were never fetched. One request, bounded in time (two when the Hub
-        // no longer has the cached commit and `main` is tried), not repeated
+        // were never fetched. One listing, every page of it, bounded in time
+        // as a whole (a second listing when the Hub no longer has the cached
+        // commit and `main` is tried), not repeated
         // for a while after it ran out of time or took seconds to fail, and
         // taken at most once per snapshot and set of patterns while the Hub
         // answers; afterwards the hit above answers. Only when there is
@@ -333,7 +334,17 @@ public enum ModelUtils {
         await withTaskGroup(of: ListingAttempt.self) { group in
             group.addTask {
                 do {
-                    return .listed(try await client.listFiles(in: repoID, kind: .model, revision: revision, recursive: true))
+                    // Every page: the Hub pages tree listings, and the
+                    // single-request `listFiles` returns only the first, so
+                    // a repository past one page would be certified against
+                    // a partial listing and a pattern that only the later
+                    // pages name would be recorded as having no file.
+                    var entries: [Git.TreeEntry] = []
+                    let pages = try await client.listAllTree(in: repoID, kind: .model, revision: revision, recursive: true)
+                    for try await page in pages {
+                        entries.append(contentsOf: page.items)
+                    }
+                    return .listed(entries)
                 } catch let error as HTTPClientError {
                     if case .responseError(let response, _) = error, response.statusCode == 404 {
                         return .notFound
